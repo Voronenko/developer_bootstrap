@@ -1,0 +1,1 @@
+Gitignore template for C# project with added NuGet package sources.

@@ -1,0 +1,2 @@
+#? sudo apt-get install npm
+sudo npm install recess uglify-js jshint -g

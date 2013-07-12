@@ -1,0 +1,4 @@
+# open in terminal in nautilus
+sudo apt-get install nautilus-open-terminal
+
+#

@@ -1,0 +1,12 @@
+sudo apt-get install git
+git config --global user.name "FIRST_NAME LAST_NAME"
+git config --global user.email "MY_NAME@example.com"
+
+# sudo nano ~/.gitconfig
+#
+# [user]
+#        name = Developer Name
+#        email = Developer GMail
+# [core]
+#        autocrlf = input
+#

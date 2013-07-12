@@ -1,0 +1,3 @@
+sudo add-apt-repository ppa:rabbitvcs/ppa
+
+echo 'deb http://ppa.launchpad.net/rabbitvcs/ppa/ubuntu **DISTRIBUTION** main' | sudo tee /etc/apt/sources.list.d/RabbitVCS.list

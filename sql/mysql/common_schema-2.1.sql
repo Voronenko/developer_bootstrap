@@ -71,12 +71,67 @@ USE common_schema;
 set @@group_concat_max_len = 1048576;
 set @current_sql_mode := @@sql_mode;
 set @@sql_mode = REPLACE(REPLACE(@@sql_mode, 'ANSI_QUOTES', ''), ',,', ',');
+-- The following needed for "split" operations copying data across tables
+set @@sql_mode = CONCAT_WS(',', @@sql_mode, 'NO_AUTO_VALUE_ON_ZERO');
 
 -- To be updated during installation process:
 set @common_schema_innodb_plugin_expected := 0;
 set @common_schema_innodb_plugin_installed := 0;
 set @common_schema_percona_server_expected := 0;
 set @common_schema_percona_server_installed := 0;
+
+DROP TABLE IF EXISTS _global_qs_variables;
+
+create table _global_qs_variables(
+    session_id int unsigned not null,
+    variable_name VARCHAR(65) CHARSET ascii NOT NULL,
+    mapped_user_defined_variable_name  VARCHAR(65) CHARSET ascii NOT NULL,
+    declaration_depth INT UNSIGNED NOT NULL,
+    declaration_id INT UNSIGNED NOT NULL,
+    scope_end_id INT UNSIGNED NOT NULL,
+    value_snapshot TEXT DEFAULT NULL,
+    PRIMARY KEY(session_id, variable_name),
+    KEY(declaration_depth),
+    KEY(declaration_id),
+    KEY(scope_end_id)
+) ENGINE=InnoDB ;
+
+DROP TABLE IF EXISTS _global_script_report_data;
+
+create table _global_script_report_data(
+    id int unsigned AUTO_INCREMENT,
+    info text charset utf8,
+    session_id int unsigned not null,
+    PRIMARY KEY (id),
+    KEY (session_id)
+) ENGINE=InnoDB ;
+
+DROP TABLE IF EXISTS _global_split_column_names_table;
+
+create table _global_split_column_names_table(
+    session_id int unsigned not null,
+    column_order TINYINT UNSIGNED,
+    split_table_name varchar(128) charset utf8,
+    split_index_name varchar(128) charset utf8,
+    column_name VARCHAR(128) charset utf8,
+    min_variable_name VARCHAR(128) charset utf8,
+    max_variable_name VARCHAR(128) charset utf8,
+    range_start_variable_name VARCHAR(128) charset utf8,
+    range_end_variable_name VARCHAR(128) charset utf8,
+    PRIMARY KEY(session_id, column_order)
+) ENGINE=InnoDB ;
+
+DROP TABLE IF EXISTS _global_sql_tokens;
+
+CREATE TABLE _global_sql_tokens (
+    session_id int unsigned
+  , id int unsigned
+  , start int unsigned  not null
+  , level int not null
+  , token text          
+  , state text not null
+  , PRIMARY KEY(session_id, id)
+) ENGINE=InnoDB ;
 
 DROP TABLE IF EXISTS _known_thread_states;
 
@@ -347,8 +402,8 @@ A copy of the GNU General Public License is available at
   ('project_home', 'http://code.google.com/p/common-schema/'),
   ('project_repository', 'https://common-schema.googlecode.com/svn/trunk/'),
   ('project_repository_type', 'svn'),
-  ('revision', '452'),
-  ('version', '2.0.0')
+  ('revision', '496'),
+  ('version', '2.1')
 ;  
 -- 
 -- Utility table: unsigned integers, [0..4095]
@@ -388,6 +443,270 @@ FROM
       DUAL
   ) AS select_counter
 ;
+--
+-- Generate a Google Image multi-line chart URL by an arbitrary query 
+--
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS google_line_chart $$
+CREATE PROCEDURE google_line_chart(
+	IN values_query TEXT, 
+	IN chart_legend TEXT
+  )
+READS SQL DATA
+SQL SECURITY INVOKER
+COMMENT 'ascii line chart'
+
+begin
+  set @_line_chart_values_query := values_query;
+  call _wrap_select_list_columns(@_line_chart_values_query, 9, @common_schema_error);
+  set @multi_line_chart_num_values := @_wrap_select_num_original_columns - 1;
+	
+  set @multi_line_chart_values_legend := ifnull(chart_legend, '');
+  set @multi_line_chart_values_legend := replace(@multi_line_chart_values_legend, ',', '|');
+  set @multi_line_chart_values_legend := replace(@multi_line_chart_values_legend, '| ', '|');
+  set @multi_line_chart_values_legend := replace(@multi_line_chart_values_legend, ' |', '|');
+  set @multi_line_chart_min_value := NULL;
+  set @multi_line_chart_max_value := NULL;
+  set @multi_line_chart_count_values := 0;
+  set @multi_line_chart_colors := SUBSTRING_INDEX('ff8c00,4682b4,9acd32,dc143c,9932cc,ffd700,191970,7fffd4,808080,dda0dd', ',', @multi_line_chart_num_values);
+  set @_line_chart_query := "
+	SELECT
+	  CONCAT(
+	    'http://chart.apis.google.com/chart?cht=lc&chs=800x350&chtt=SQL+chart+by+common_schema&chxt=x,y&chxr=1,',
+	    ROUND(MIN(min_value), 1), ',',
+	    ROUND(MAX(max_value), 1),
+	    '&chd=s:',
+	    TRIM(LEADING ',' FROM GROUP_CONCAT(
+		  IF(count_values = 1, ',', ''),
+          IF(
+	        row_value IS NULL,
+	        '_',
+	        SUBSTRING(
+	          'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789',
+	          1+round(61*(row_value - min_value)/(max_value - min_value)),
+	          1
+            )
+	      )
+          ORDER BY n,count_values
+	      SEPARATOR ''
+	    )),
+	   '&chxs=0,505050,10,0,lt',
+	   '&chxl=0:|',
+	    GROUP_CONCAT(
+	      IF(
+	        n = 1,
+	        IF(
+              count_values IN (1, ROUND(@multi_line_chart_count_values/4), ROUND(@multi_line_chart_count_values/2), ROUND (@multi_line_chart_count_values*3/4), @multi_line_chart_count_values),
+	          ordering_column,
+	          ''
+	        ),
+	        NULL
+	      )
+          ORDER BY ordering_column
+	      SEPARATOR '|'
+	    ),
+	   '&chg=', (100.0/(@multi_line_chart_count_values-1)), ',25,1,2,0,0',
+       '&chco=${multi_line_chart_colors}',
+	   '&chdl=${multi_line_chart_values_legend}',
+       '&chdlp=b'
+	  ) as google_chart_url
+      FROM 
+        (
+        SELECT 
+            n,
+            ordering_column,
+            row_value,
+            count_values,
+            @multi_line_chart_min_value AS min_value,
+            @multi_line_chart_max_value AS max_value
+        FROM
+          (SELECT
+            *,
+            @multi_line_chart_min_value := LEAST(IFNULL(cast(@multi_line_chart_min_value as decimal(64,20)), row_value), IFNULL(row_value, cast(@multi_line_chart_min_value as decimal(64,20)))) AS min_value,
+            @multi_line_chart_max_value := GREATEST(IFNULL(cast(@multi_line_chart_max_value as decimal(64,20)), row_value), IFNULL(row_value, cast(@multi_line_chart_max_value as decimal(64,20)))) AS max_value,
+            if (n = 1, @multi_line_chart_count_values := @multi_line_chart_count_values + 1, @multi_line_chart_count_values) as count_values
+          FROM
+            (SELECT
+              *,
+              col1 as ordering_column,
+              cast(
+                case n
+                  when 1 then col2   
+                  when 2 then col3   
+                  when 3 then col4   
+                  when 4 then col5   
+                  when 5 then col6   
+                  when 6 then col7   
+                  when 7 then col8   
+                  when 8 then col9   
+                end 
+                as DECIMAL(64,20)
+              ) AS row_value
+            FROM
+              numbers,
+              (${wrapped_query}) AS sel_main_values
+            WHERE
+              numbers.n BETWEEN 1 AND @multi_line_chart_num_values
+            ) sel_counted_values_main_values
+          ) selec_data
+		) select_data_min_max
+  ";
+  set @_line_chart_query := replace(@_line_chart_query, '${wrapped_query}', @_line_chart_values_query);
+  set @_line_chart_query := replace(@_line_chart_query, '${multi_line_chart_colors}', @multi_line_chart_colors);
+  set @_line_chart_query := replace(@_line_chart_query, '${multi_line_chart_values_legend}', @multi_line_chart_values_legend);
+  
+  call exec_single(@_line_chart_query);
+end $$
+
+DELIMITER ;
+--
+-- Generate an ASCII multi-line chart based on an arbitrary query
+--
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS line_chart $$
+CREATE PROCEDURE line_chart(
+	IN values_query TEXT, 
+	IN chart_legend TEXT
+  )
+READS SQL DATA
+SQL SECURITY INVOKER
+COMMENT 'ascii line chart'
+
+begin
+  set @_line_chart_values_query := values_query;
+  call _wrap_select_list_columns(@_line_chart_values_query, 9, @common_schema_error);
+  set @multi_line_chart_num_values := @_wrap_select_num_original_columns - 1;
+	
+  set @multi_line_chart_bar_length := NULL;
+  set @multi_line_chart_values_legend := ifnull(chart_legend, '');
+  set @multi_line_chart_min_value := NULL;
+  set @multi_line_chart_max_value := NULL;
+  set @multi_line_chart_graph_rows := 17;
+  set @_line_chart_query := "
+	SELECT
+	  cast(y_scale as decimal(64,${multi_line_chart_value_precision})) as y_scale,
+	  horizontal_bar as common_schema_chart
+	  FROM
+	  (
+	  SELECT
+	    @multi_line_chart_row_number := @multi_line_chart_row_number+1,
+	    CASE @multi_line_chart_row_number
+	      WHEN 1                            THEN @multi_line_chart_max_value
+	      WHEN @multi_line_chart_graph_rows THEN @multi_line_chart_min_value
+	      ELSE                              @multi_line_chart_max_value-(@multi_line_chart_max_value-@multi_line_chart_min_value)*(@multi_line_chart_row_number-1)/(@multi_line_chart_graph_rows-1)
+	    END AS y_scale,
+	    horizontal_bar,
+	    @multi_line_chart_bar_length := IFNULL(@multi_line_chart_bar_length, CHAR_LENGTH(horizontal_bar))
+	  FROM
+	    (SELECT @multi_line_chart_row_number := 0) AS select_row
+	    INNER JOIN
+	    (
+	    SELECT
+	      GROUP_CONCAT(SUBSTRING(unwalked_bar, numbers.n, 1) ORDER BY ordering_column SEPARATOR '') AS horizontal_bar
+	    FROM
+	      numbers
+	    INNER JOIN (
+	      SELECT
+	        ordering_column,
+	        GROUP_CONCAT(bar_string_token ORDER BY string_position SEPARATOR '') AS unwalked_bar
+	      FROM
+	        (SELECT
+	          ordering_column,
+	          string_position,
+	          min(scaled_string_position) as scaled_string_position,
+	          REPLACE(LEFT(GROUP_CONCAT(bar_string_token ORDER BY bar_string_token DESC SEPARATOR ''), 1), ' ', '-') AS bar_string_token
+	        FROM
+	          (SELECT
+	            ordering_column,
+	            @multi_line_chart_scaled_string_position := CONVERT((row_value-@multi_line_chart_min_value)*(@multi_line_chart_graph_rows-1)/(@multi_line_chart_max_value-@multi_line_chart_min_value), UNSIGNED) AS scaled_string_position,
+	            n AS string_position,
+	            IF(numbers.n = @multi_line_chart_scaled_string_position+1, SUBSTRING(@multi_line_chart_graph_colors, row_value_indicator, 1), ' ') AS bar_string_token
+	          FROM
+	            numbers,
+	            (SELECT
+	              ordering_column,
+	              n AS row_value_indicator,
+	              row_value
+	            FROM (
+	              SELECT
+	                *,
+	                @multi_line_chart_min_value := LEAST(IFNULL(cast(@multi_line_chart_min_value as decimal(64,20)), row_value), IFNULL(row_value, cast(@multi_line_chart_min_value as decimal(64,20)))) AS min_value,
+    	            @multi_line_chart_max_value := GREATEST(IFNULL(cast(@multi_line_chart_max_value as decimal(64,20)), row_value), IFNULL(row_value, cast(@multi_line_chart_max_value as decimal(64,20)))) AS max_value,
+	                @multi_line_chart_min_range := LEAST(IFNULL(@multi_line_chart_min_range, ordering_column), ordering_column) AS min_range,
+	                @multi_line_chart_max_range := GREATEST(IFNULL(@multi_line_chart_max_range, ordering_column), ordering_column) AS max_range
+	              FROM
+	                (SELECT
+	                  *,
+	                  col1 as ordering_column,
+	                  cast(
+                        case n
+	                      when 1 then col2   
+	                      when 2 then col3   
+	                      when 3 then col4   
+	                      when 4 then col5   
+	                      when 5 then col6   
+	                      when 6 then col7   
+	                      when 7 then col8   
+	                      when 8 then col9   
+	                    end 
+                        as DECIMAL(64,20)
+                      ) AS row_value
+	                FROM
+	                  numbers,
+	                  (${wrapped_query}) AS sel_main_values,
+	                  (SELECT @multi_line_chart_bar_length := NULL) AS select_nullify_bar_length,
+	                  (SELECT @multi_line_chart_min_range := NULL) AS select_min_range,
+	                  (SELECT @multi_line_chart_max_range := NULL) AS select_max_range,
+	                  (SELECT @multi_line_chart_graph_colors := '#*@%o+x;m:') AS select_graph_colors,
+	                  (SELECT @multi_line_chart_graph_fallback_colors := 'abcdefghij') AS select_graph_fallback_colors,
+	                  (SELECT @multi_line_chart_value_precision := 2) AS select_value_precision	                  
+	                WHERE
+	                  numbers.n BETWEEN 1 AND @multi_line_chart_num_values
+	                ) sel_counted_values_main_values
+	              ) sel_row_values
+	            ) AS sel_row_values_indicators
+	          WHERE
+	            numbers.n BETWEEN 1 AND @multi_line_chart_graph_rows
+	          ) AS sel_marked_row_values
+	        GROUP BY
+	          ordering_column, string_position
+	        ) AS sel_walked_bar
+	      GROUP BY
+	        ordering_column
+	    ) AS select_vertical
+	    WHERE
+	      numbers.n BETWEEN 1 AND CHAR_LENGTH(unwalked_bar)
+	    GROUP BY
+	      numbers.n
+	    ORDER BY
+	      numbers.n DESC
+	    ) AS select_horizontal
+	  ) AS select_horizontal_untitled
+	UNION ALL
+	SELECT '', CONCAT('v', REPEAT(':', @multi_line_chart_bar_length-2), 'v')
+	UNION ALL
+	SELECT '', CONCAT(@multi_line_chart_min_range, REPEAT(' ', @multi_line_chart_bar_length-CHAR_LENGTH(@multi_line_chart_min_range)-CHAR_LENGTH(@multi_line_chart_max_range)), @multi_line_chart_max_range)
+	UNION ALL
+	SELECT
+	  '', CONCAT('    ', SUBSTRING(@multi_line_chart_graph_colors, n, 1), ' ', trim_wspace(SUBSTRING_INDEX(SUBSTRING_INDEX(@multi_line_chart_values_legend, ',', n), ',', -1)))
+	FROM
+	  numbers
+	WHERE
+	  n BETWEEN 1 AND @multi_line_chart_num_values
+	  AND @multi_line_chart_values_legend IS NOT NULL
+
+  ";
+  set @_line_chart_query := replace(@_line_chart_query, '${wrapped_query}', @_line_chart_values_query);
+  set @_line_chart_query := replace(@_line_chart_query, '${multi_line_chart_value_precision}', @multi_line_chart_value_precision);
+  
+  call exec_single(@_line_chart_query);
+end $$
+
+DELIMITER ;
 -- 
 -- This code is free software; you can redistribute it and/or modify it under
 -- the terms of the GNU General Public License as published by the Free Software
@@ -775,7 +1094,7 @@ DELIMITER ;
 -- Foundation, version 2
 --
 -- 
--- Write down current variable (variables within current scope)
+-- Write down current variables (variables within current scope)
 -- into global variables state table
 -- 
 
@@ -931,7 +1250,10 @@ SQL SECURITY INVOKER
 COMMENT ''
 
 begin
-  return '/* [_common_schema_debug_] */';
+  -- The reson the next text is broken is that we wish to avoid mistakenly identify this
+  -- very routines as being a "with debug mode" due to the appearance of the magic
+  -- start-code. Much like "ps aux | grep ... | grep -v grep"
+  return CONCAT('/* [_common_schema_debug_', '] */');
 end $$
 
 DELIMITER ;
@@ -3847,6 +4169,10 @@ begin
                             set p_state = 'system variable', v_from = v_from + 1;
                         else
                             set p_state = 'user-defined variable';
+                            if v_lookahead = '''' then
+                                set v_from = v_from + 1;
+                                leave my_loop;
+                            end if;
                         end if;
                     when v_char = '$' and allow_script_tokens then
                         set p_state = 'query_script variable';
@@ -4579,6 +4905,34 @@ begin
   end if;
   
   call exec(sql_grants_statement);
+end $$
+
+DELIMITER ;
+
+--
+-- Grant SELECT & EXECUTE to all grantees on common_schema
+--
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS grant_access $$
+CREATE PROCEDURE grant_access() 
+MODIFIES SQL DATA
+SQL SECURITY INVOKER
+COMMENT 'Grant SELECT & EXECUTE to all on common_schema'
+
+begin
+  declare grant_query TEXT charset utf8 default null;
+  
+  set grant_query := '
+    select 
+      concat(''GRANT SELECT, EXECUTE ON '', 
+        mysql_qualify(DATABASE()), ''.* TO '', GRANTEE) AS grant_query
+      from
+        sql_show_grants'
+  ;
+  
+  call eval(grant_query);
 end $$
 
 DELIMITER ;
@@ -5659,6 +6013,7 @@ main_body: begin
                 end if;
               end if;
             end if;
+            call _drop_array(foreach_variables_array_id);
 	      end;
         when first_state = 'alpha' AND first_token = 'split' then begin
 	        call _consume_split_statement(id_from + 1, id_to, consumed_to_id, depth, split_table_schema, split_table_name, split_injected_action_statement, split_injected_text, split_options, should_execute_statement);
@@ -5864,21 +6219,14 @@ begin
     declare v_state varchar(32);
     declare _sql_tokens_id int unsigned default 0;
     
-    drop temporary table if exists _sql_tokens;
-    create temporary table _sql_tokens(
-        id int unsigned primary key
-    ,   start int unsigned  not null
-    ,   level int not null
-    ,   token text          
-    ,   state text           not null
-    ) engine=MyISAM;
-    
+    delete from _sql_tokens;
+    start transaction;
     repeat 
         set v_old_from = v_from;
         call _get_sql_token(p_text, v_from, v_level, v_token, 'script', v_state);
         set _sql_tokens_id := _sql_tokens_id + 1;
-        insert into _sql_tokens(id,start,level,token,state) 
-        values (_sql_tokens_id, v_from, v_level, v_token, v_state);
+        insert into _sql_tokens(session_id,id,start,level,token,state) 
+        values (CONNECTION_ID(),_sql_tokens_id, v_from, v_level, v_token, v_state);
     until 
         v_old_from = v_from
     end repeat;
@@ -5888,6 +6236,7 @@ begin
       from _sql_tokens
       order by id;
     end if;
+    commit;
 end;
 //
 
@@ -5935,32 +6284,7 @@ main_body: begin
     call throw('Invalid nesting level detected at end of script');
   end if;
 
-  drop temporary table if exists _qs_variables;
-  create temporary table _qs_variables(
-      variable_name VARCHAR(65) CHARSET ascii NOT NULL,
-      mapped_user_defined_variable_name  VARCHAR(65) CHARSET ascii NOT NULL,
-      declaration_depth INT UNSIGNED NOT NULL,
-      declaration_id INT UNSIGNED NOT NULL,
-      scope_end_id INT UNSIGNED NOT NULL,
-      value_snapshot TEXT DEFAULT NULL,
-      PRIMARY KEY(variable_name),
-      KEY(declaration_depth),
-      KEY(declaration_id),
-      KEY(scope_end_id)
-  ) engine=MyISAM;
---  create temporary table _qs_variables(
---      _qs_variables_id int unsigned auto_increment,
---      variable_name VARCHAR(65) CHARSET ascii NOT NULL,
---      mapped_user_defined_variable_name  VARCHAR(65) CHARSET ascii NOT NULL,
---      declaration_depth INT UNSIGNED NOT NULL,
---      declaration_id INT UNSIGNED NOT NULL,
---      scope_end_id INT UNSIGNED NOT NULL,
---      value_snapshot TEXT DEFAULT NULL,
---      PRIMARY KEY(_qs_variables_id),
---      KEY(variable_name),
---      KEY(declaration_depth),
---      KEY(declaration_id)
---  ) engine=MyISAM;
+  delete from _qs_variables;
   
   -- Identify ${my_var} expanded variables. These are initially not identified as a state.
   -- We hack the _sql_tokens table to make these in their own state, combining multiple rows into one,
@@ -6016,6 +6340,12 @@ main_body: begin
   end if;
   
   set @@group_concat_max_len := @__script_group_concat_max_len;  
+  if not (@query_script_skip_cleanup is true) then
+    delete from _sql_tokens;
+    delete from _qs_variables;
+    delete from _script_report_data;
+    -- delete from _split_column_names_table;
+  end if;
 end;
 //
 
@@ -6127,12 +6457,8 @@ begin
   declare is_horizontal_ruler tinyint unsigned default 0;
   
   if not @_common_schema_script_report_used then
-    drop temporary table if exists _script_report_data;
-    create temporary table _script_report_data (
-      id int unsigned AUTO_INCREMENT,
-      info text charset utf8,
-      PRIMARY KEY (id)
-    ) engine=MyISAM;
+    -- First report in this script. Make sure to clean up first.
+    delete from _script_report_data;
     set @_common_schema_script_report_used := true;
   end if;
   
@@ -6175,9 +6501,9 @@ begin
   end if;
   
   insert into 
-    _script_report_data (info) 
+    _script_report_data (session_id, info) 
   SELECT 
-    split_token(@_query_script_report_line, '\n', n)
+    CONNECTION_ID(), split_token(@_query_script_report_line, '\n', n)
   FROM
     numbers
   WHERE 
@@ -7032,7 +7358,8 @@ main_body: begin
   --   call _throw_script_error(id_from, CONCAT('Duplicate local variable: ', local_variable));
   -- end if;
    
-  INSERT IGNORE INTO _qs_variables (variable_name, mapped_user_defined_variable_name, declaration_depth, declaration_id, scope_end_id) VALUES (local_variable, user_defined_variable_name, depth, id_variable_declaration, id_to);
+  INSERT IGNORE INTO _qs_variables (session_id, variable_name, mapped_user_defined_variable_name, declaration_depth, declaration_id, scope_end_id) 
+    VALUES (CONNECTION_ID(), local_variable, user_defined_variable_name, depth, id_variable_declaration, id_to);
   if ROW_COUNT() = 0 and throw_when_exists then
     call _throw_script_error(id_variable_declaration, CONCAT('Duplicate local variable: ', local_variable));
   end if;
@@ -7657,6 +7984,7 @@ COMMENT 'split values by columns...'
 
 main_body: begin
   declare is_overflow tinyint unsigned;
+  declare is_range_identical tinyint unsigned;
   declare is_empty_range tinyint unsigned;
   declare deadlock_detected tinyint unsigned;
   declare split_range_size int unsigned;
@@ -7666,7 +7994,6 @@ main_body: begin
 
   set @_split_is_first_step_flag := true;
   
-  call _split_generate_dependency_tables(split_table_schema, split_table_name);
   call _split_deduce_columns(split_table_schema, split_table_name);
   call _split_init_variables();
   call _split_assign_min_max_variables(id_from, split_table_schema, split_table_name, split_options, is_empty_range);
@@ -7682,6 +8009,7 @@ main_body: begin
   set @query_script_split_start_time := SYSDATE();
   
   call _declare_local_variable(id_from, id_from, id_to, depth, '$split_columns', '@query_script_split_columns', FALSE);
+  call _declare_local_variable(id_from, id_from, id_to, depth, '$split_index', '@query_script_split_index_name', FALSE);
   call _declare_local_variable(id_from, id_from, id_to, depth, '$split_min', '@query_script_split_min', FALSE);
   call _declare_local_variable(id_from, id_from, id_to, depth, '$split_max', '@query_script_split_max', FALSE);
   call _declare_local_variable(id_from, id_from, id_to, depth, '$split_clause', '@query_script_split_comparison_clause', FALSE);
@@ -7694,7 +8022,7 @@ main_body: begin
   call _declare_local_variable(id_from, id_from, id_to, depth, '$split_table_schema', '@query_script_split_table_schema', FALSE);
   call _declare_local_variable(id_from, id_from, id_to, depth, '$split_table_name', '@query_script_split_table_name', FALSE);
   
-  set split_range_size := least(10000, greatest(100, floor(ifnull(get_option(split_options, 'size'), 1000))));
+  set split_range_size := least(50000, greatest(100, floor(ifnull(get_option(split_options, 'size'), 1000))));
   _split_step_loop: loop
     call _split_is_range_start_overflow(is_overflow);
     if is_overflow and not @_split_is_first_step_flag then
@@ -7702,6 +8030,10 @@ main_body: begin
     end if;
     call _split_assign_range_end_variables(split_table_schema, split_table_name, split_range_size);
     -- We now have a range start+end
+    call _split_is_range_start_end_identical(is_range_identical);
+    if is_range_identical and not @_split_is_first_step_flag then
+      leave _split_step_loop;
+    end if;
     -- start split step operation
     call _split_get_step_comparison_clause(comparison_clause);
 
@@ -7725,6 +8057,7 @@ main_body: begin
       set @query_script_split_min := @_query_script_split_min;
       set @query_script_split_max := @_query_script_split_max;
       set @query_script_split_columns := @_query_script_split_columns;
+      set @query_script_split_index_name := @_query_script_split_index_name;
       call _split_set_step_clause_and_ranges_local_variables(comparison_clause);
     
       call _consume_statement(id_from, id_to, expect_single, consumed_to_id, depth, should_execute_statement);
@@ -7800,6 +8133,8 @@ begin
   declare columns_order_descending_clause text default _split_get_columns_order_descending_clause();
   declare max_variables_names text default _split_get_max_variables_names();
   declare columns_count tinyint unsigned default _split_get_columns_count();
+  declare start_values text default get_option(split_options, 'start');
+  declare stop_values text default get_option(split_options, 'stop');
   
   set is_empty_range := false;
 
@@ -7821,41 +8156,47 @@ begin
   );
   call exec_single(query);
   
-  if get_option(split_options, 'start') is not null then
-    if columns_count = 1 then
-      set query := CONCAT(
-        'set ', min_variables_names, ' := GREATEST(', min_variables_names, ', ', QUOTE(get_option(split_options, 'start')), ')'
-      );
-      call exec_single(query);
+  if start_values is not null then
+    if columns_count = get_num_tokens(start_values, ',') then
+      select 
+          group_concat('set ', min_variable_name, ' := ', QUOTE(split_token(start_values, ',', column_order)), ';' order by column_order separator '')
+        from
+          _split_column_names_table
+        into query;
+      call exec(query);
       set manual_min_max_params_used := true;
     else
-      call _throw_script_error(id_from, 'Found ''start'' option, but this split uses multiple columns');
+      call _throw_script_error(id_from, CONCAT(get_num_tokens(start_values, ','), ' ''start'' value[s] provided; chosen index has ', columns_count, ' columns'));
     end if;
   end if;
-  if get_option(split_options, 'stop') is not null then
-    if columns_count = 1 then
-      set query := CONCAT(
-        'set ', max_variables_names, ' := LEAST(', max_variables_names, ', ', QUOTE(get_option(split_options, 'stop')), ')'
-      );
-      call exec_single(query);
+  if stop_values is not null then
+    if columns_count = get_num_tokens(stop_values, ',') then
+      select 
+          group_concat('set ', max_variable_name, ' := ', QUOTE(split_token(stop_values, ',', column_order)), ';' order by column_order separator '')
+        from
+          _split_column_names_table
+        into query;
+      call exec(query);
       set manual_min_max_params_used := true;
     else
-      call _throw_script_error(id_from, 'Found ''stop'' option, but this split uses multiple columns');
+      call _throw_script_error(id_from, CONCAT(get_num_tokens(stop_values, ','), ' ''stop'' value[s] provided; chosen index has ', columns_count, ' columns'));
     end if;
   end if;
   if manual_min_max_params_used then
+
     -- Due to manual intervention, we need to verify boundaries.
     -- We know for certain there is one column in splitting key (due to above checks)
     select 
       CONCAT(
         'SELECT (',
-          min_variable_name, ' > ', max_variable_name,
+          GROUP_CONCAT(min_variable_name order by column_order), ') > (', GROUP_CONCAT(max_variable_name order by column_order),
         ') INTO @_split_is_empty_range_result'
         )
       from _split_column_names_table
       into query;
 
     call exec_single(query);
+    
     if @_split_is_empty_range_result then
       set is_empty_range := true;
     end if;
@@ -7988,6 +8329,26 @@ DELIMITER ;
 
 DELIMITER $$
 
+DROP PROCEDURE IF EXISTS _split_cleanup_dependency_tables $$
+CREATE PROCEDURE _split_cleanup_dependency_tables() 
+MODIFIES SQL DATA
+SQL SECURITY INVOKER
+COMMENT 'drop temporary tables'
+
+begin
+  drop temporary table if exists _split_unique_key_columns;
+  drop temporary table if exists _split_i_s_columns;
+  drop temporary table if exists _split_candidate_keys;
+  drop temporary table if exists _split_candidate_keys_recommended;
+end $$
+
+DELIMITER ;
+-- 
+-- 
+-- 
+
+DELIMITER $$
+
 DROP PROCEDURE IF EXISTS _split_deduce_columns $$
 CREATE PROCEDURE _split_deduce_columns(split_table_schema varchar(128), split_table_name varchar(128)) 
 MODIFIES SQL DATA
@@ -7997,32 +8358,33 @@ COMMENT 'split values by columns...'
 begin
   declare split_column_names varchar(2048) default NULL;
   declare split_num_column tinyint unsigned;
+
+  call _split_generate_dependency_tables(split_table_schema, split_table_name);
   
   SELECT 
-      column_names, count_column_in_index
+      column_names, count_column_in_index, index_name
     FROM 
       _split_candidate_keys_recommended 
     WHERE 
       table_schema = split_table_schema AND table_name = split_table_name 
-    INTO split_column_names, split_num_column;
+    INTO split_column_names, split_num_column, @_query_script_split_index_name
+  ;
+    
+  call _split_cleanup_dependency_tables();
+
   if split_column_names is null then
     call throw(CONCAT('split: no key or definition found for: ', split_table_schema, '.', split_table_name));
   end if;
-  
-  drop temporary table if exists _split_column_names_table;
-  create temporary table _split_column_names_table (
-    column_order TINYINT UNSIGNED,
-    split_table_name varchar(128) charset utf8,
-    column_name VARCHAR(128) charset utf8,
-    min_variable_name VARCHAR(128) charset utf8,
-    max_variable_name VARCHAR(128) charset utf8,
-    range_start_variable_name VARCHAR(128) charset utf8,
-    range_end_variable_name VARCHAR(128) charset utf8
-  );
+
+  -- There can't be nested "split" operations. Therefore there can't be two "instances"
+  -- of "split" for this session.
+  delete from _split_column_names_table;
   insert into _split_column_names_table
     select
+      CONNECTION_ID(),
       n,
       split_table_name,
+      @_query_script_split_index_name,
       split_token(split_column_names, ',', n),
       CONCAT('@_split_column_variable_min_', n),
       CONCAT('@_split_column_variable_max_', n),
@@ -8031,13 +8393,15 @@ begin
     from
       numbers
     where 
-      n between 1 and split_num_column;
+      n between 1 and split_num_column
+  ;
+  
   select
     group_concat(mysql_qualify(column_name) order by column_order)
   from
     _split_column_names_table
   into
-    @_query_script_split_columns;
+    @_query_script_split_columns;    
 end $$
 
 DELIMITER ;
@@ -8051,39 +8415,66 @@ DROP PROCEDURE IF EXISTS _split_generate_dependency_tables $$
 CREATE PROCEDURE _split_generate_dependency_tables(split_table_schema varchar(128), split_table_name varchar(128)) 
 MODIFIES SQL DATA
 SQL SECURITY INVOKER
-COMMENT 'split values by columns...'
+COMMENT 'analyze recommended keys'
 
 begin
   declare split_column_names varchar(2048) default NULL;
   declare split_num_column tinyint unsigned;
   
-  drop temporary table if exists _split_unique_keys;
-  create temporary table _split_unique_keys
+  drop temporary table if exists _split_unique_key_columns;
+  create temporary table _split_unique_key_columns engine=MyISAM
    SELECT
       TABLE_SCHEMA,
       TABLE_NAME,
       INDEX_NAME,
-      COUNT(*) AS COUNT_COLUMN_IN_INDEX,
-      IF(SUM(NULLABLE = 'YES') > 0, 1, 0) AS has_nullable,
-      IF(INDEX_NAME = 'PRIMARY', 1, 0) AS is_primary,
-      GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX ASC) AS COLUMN_NAMES,
-      SUBSTRING_INDEX(GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX ASC), ',', 1) AS FIRST_COLUMN_NAME
+      COLUMN_NAME,
+      SEQ_IN_INDEX,
+      (NULLABLE = 'YES') AS has_nullable,
+      (INDEX_NAME = 'PRIMARY') AS is_primary
     FROM INFORMATION_SCHEMA.STATISTICS
     WHERE
       TABLE_SCHEMA = split_table_schema
       AND TABLE_NAME = split_table_name
       AND NON_UNIQUE=0
-    GROUP BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME
   ;
   
   drop temporary table if exists _split_i_s_columns;
-  create temporary table _split_i_s_columns
+  create temporary table _split_i_s_columns engine=MyISAM
    SELECT
       TABLE_SCHEMA,
       TABLE_NAME,
       COLUMN_NAME,
-      DATA_TYPE,
-      CHARACTER_SET_NAME
+      CASE LOWER(DATA_TYPE)
+          WHEN 'tinyint' THEN 1
+          WHEN 'smallint' THEN 2
+          WHEN 'mediumint' THEN 4
+          WHEN 'int' THEN 4
+          WHEN 'bigint' THEN 8
+          WHEN 'timestamp' THEN 4
+          WHEN 'time' THEN 4
+          WHEN 'date' THEN 4
+          WHEN 'datetime' THEN 8
+          WHEN 'float' THEN 4
+          WHEN 'double' THEN 8
+          WHEN 'decimal' THEN CEILING(NUMERIC_PRECISION/2)
+          WHEN 'bit' THEN CEILING(NUMERIC_PRECISION/8)
+          WHEN 'set' THEN 8
+          WHEN 'enum' THEN 8
+          WHEN 'year' THEN 2
+          WHEN 'char' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'varchar' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'binary' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'varbinary' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'tinytext' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'text' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'mediumtext' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'longtext' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'tinyblob' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'blob' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'mediumblob' THEN CHARACTER_OCTET_LENGTH
+          WHEN 'longblob' THEN CHARACTER_OCTET_LENGTH
+          ELSE 255
+        END AS column_type_length
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE
       TABLE_SCHEMA = split_table_schema
@@ -8091,63 +8482,32 @@ begin
   ;
   
   drop temporary table if exists _split_candidate_keys;
-  create temporary table _split_candidate_keys
-    SELECT
-      _split_i_s_columns.TABLE_SCHEMA AS table_schema,
-      _split_i_s_columns.TABLE_NAME AS table_name,
-      _split_unique_keys.INDEX_NAME AS index_name,
-      _split_unique_keys.has_nullable AS has_nullable,
-      _split_unique_keys.is_primary AS is_primary,
-      _split_unique_keys.COLUMN_NAMES AS column_names,
-      _split_unique_keys.COUNT_COLUMN_IN_INDEX AS count_column_in_index,
-      _split_i_s_columns.DATA_TYPE AS data_type,
-      _split_i_s_columns.CHARACTER_SET_NAME AS character_set_name,
-      (if (has_nullable, 1, 0) << 21) 
-        +
-        (CASE IFNULL(CHARACTER_SET_NAME, '')
-            WHEN '' THEN 0
-            ELSE 1
-        END << 20
-        )
-        + (CASE LOWER(DATA_TYPE)
-          WHEN 'tinyint' THEN 0
-          WHEN 'smallint' THEN 1
-          WHEN 'int' THEN 2
-          WHEN 'timestamp' THEN 3
-          WHEN 'bigint' THEN 4
-          WHEN 'datetime' THEN 5
-          ELSE 9
-        END << 16
-        ) + (COUNT_COLUMN_IN_INDEX << 0
-      ) AS candidate_key_rank_in_table  
+  create temporary table _split_candidate_keys engine=MyISAM
+   SELECT
+      TABLE_SCHEMA,
+      TABLE_NAME,
+      INDEX_NAME,
+      MAX(has_nullable) AS has_nullable,
+      MAX(is_primary) AS is_primary,
+      COUNT(*) AS count_column_in_index,
+      GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX ASC) AS COLUMN_NAMES,
+      SUM(column_type_length) AS covered_columns_length
     FROM 
-      _split_i_s_columns
-      INNER JOIN _split_unique_keys ON (
-        _split_i_s_columns.TABLE_SCHEMA = _split_unique_keys.TABLE_SCHEMA AND
-        _split_i_s_columns.TABLE_NAME = _split_unique_keys.TABLE_NAME AND
-        _split_i_s_columns.COLUMN_NAME = _split_unique_keys.FIRST_COLUMN_NAME
-      )
-    ORDER BY   
-      _split_i_s_columns.TABLE_SCHEMA, _split_i_s_columns.TABLE_NAME, candidate_key_rank_in_table
+      _split_unique_key_columns
+      JOIN _split_i_s_columns USING(TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME)
+    GROUP BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME
   ;
-  
+
   drop temporary table if exists _split_candidate_keys_recommended;
-  create temporary table _split_candidate_keys_recommended
+  create temporary table _split_candidate_keys_recommended engine=MyISAM
     SELECT
-      table_schema,
-      table_name,	
-      SUBSTRING_INDEX(GROUP_CONCAT(index_name ORDER BY candidate_key_rank_in_table ASC), ',', 1) AS recommended_index_name,
-      CAST(SUBSTRING_INDEX(GROUP_CONCAT(has_nullable ORDER BY candidate_key_rank_in_table ASC), ',', 1) AS UNSIGNED INTEGER) AS has_nullable,
-      CAST(SUBSTRING_INDEX(GROUP_CONCAT(is_primary ORDER BY candidate_key_rank_in_table ASC), ',', 1) AS UNSIGNED INTEGER) AS is_primary,
-      CAST(SUBSTRING_INDEX(GROUP_CONCAT(count_column_in_index ORDER BY candidate_key_rank_in_table ASC), ',', 1) AS UNSIGNED INTEGER) AS count_column_in_index,
-      SUBSTRING_INDEX(GROUP_CONCAT(column_names ORDER BY candidate_key_rank_in_table ASC SEPARATOR '\n'), '\n', 1) AS column_names
+      *
     FROM 
       _split_candidate_keys
-    GROUP BY
-      table_schema, table_name
     ORDER BY   
-      table_schema, table_name
-    ;
+      has_nullable ASC, covered_columns_length ASC, is_primary DESC
+    LIMIT 1
+  ;
   
 end $$
 
@@ -8490,6 +8850,32 @@ COMMENT ''
 
 begin
   return @_split_is_first_step_flag;
+end $$
+
+DELIMITER ;
+-- 
+-- 
+-- 
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS _split_is_range_start_end_identical $$
+CREATE PROCEDURE _split_is_range_start_end_identical(out is_identical tinyint unsigned) 
+READS SQL DATA
+SQL SECURITY INVOKER
+COMMENT ''
+
+begin
+  declare query text default NULL;
+
+  declare range_start_variables_names text default _split_get_range_start_variables_names();
+  declare range_end_variables_names text default _split_get_range_end_variables_names();
+
+  set query := CONCAT(
+    'select (', range_start_variables_names, ') = (', range_end_variables_names, ') into @_split_is_identical'
+  );
+  call exec_single(query);
+  set is_identical := @_split_is_identical;
 end $$
 
 DELIMITER ;
@@ -9806,9 +10192,9 @@ BEGIN
 END $$
 
 DELIMITER ;
--- 
+--
 -- Returns DATE of easter day in given DATETIME's year
--- 
+--
 -- Example:
 --
 -- SELECT easter_day('2011-01-01');
@@ -9829,17 +10215,11 @@ BEGIN
     DECLARE a    SMALLINT DEFAULT p_year % 19;
     DECLARE b    SMALLINT DEFAULT p_year DIV 100;
     DECLARE c    SMALLINT DEFAULT p_year % 100;
-    DECLARE d    SMALLINT DEFAULT b DIV 4;
     DECLARE e    SMALLINT DEFAULT b % 4;
-    DECLARE f    SMALLINT DEFAULT (b + 8) DIV 25;
-    DECLARE g    SMALLINT DEFAULT (b - f + 1) DIV 3;
-    DECLARE h    SMALLINT DEFAULT (19*a + b - d - g + 15) % 30;
-    DECLARE i    SMALLINT DEFAULT c DIV 4;
-    DECLARE k    SMALLINT DEFAULT c % 4;
-    DECLARE L    SMALLINT DEFAULT (32 + 2*e + 2*i - h - k) % 7;
-    DECLARE m    SMALLINT DEFAULT (a + 11*h + 22*L) DIV 451;
-    DECLARE v100 SMALLINT DEFAULT h + L - 7*m + 114;
-        
+    DECLARE h    SMALLINT DEFAULT (19*a + b - (b DIV 4) - ((b - ((b + 8) DIV 25) + 1) DIV 3) + 15) % 30;
+    DECLARE L    SMALLINT DEFAULT (32 + 2*e + 2*(c DIV 4) - h - (c % 4)) % 7;
+    DECLARE v100 SMALLINT DEFAULT h + L - 7*((a + 11*h + 22*L) DIV 451) + 114;
+
     RETURN STR_TO_DATE(
                 CONCAT(
                     p_year
@@ -9853,6 +10233,7 @@ BEGIN
 END $$
 
 DELIMITER ;
+
 -- 
 -- Checks whether the given string is a valid datetime.
 -- 
@@ -10206,8 +10587,61 @@ VIEW redundant_keys AS
     )
 ;
 -- 
--- Generate ALTER TABLE statements per table, with engine and create options
+-- Generate ALTER TABLE statements per table, with keys, engine and create options
 -- 
+
+
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW _sql_table_keys AS
+  SELECT 
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    INDEX_NAME,
+    CONCAT(
+      IF(MIN(NON_UNIQUE) = 0, IF(INDEX_NAME='PRIMARY', 'PRIMARY ', 'UNIQUE '), ''),
+      'KEY ', 
+      IF(INDEX_NAME='PRIMARY', '', mysql_qualify(INDEX_NAME)), '(',
+        GROUP_CONCAT(
+          mysql_qualify(COLUMN_NAME),
+          IFNULL(
+            CONCAT('(', SUB_PART,')'),
+            ''
+            )
+          ORDER BY SEQ_IN_INDEX
+        ),
+      ')'
+      ) as sql_index_definition
+  FROM 
+    INFORMATION_SCHEMA.STATISTICS
+  WHERE
+    TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'performance_schema')
+  GROUP BY
+    TABLE_SCHEMA, TABLE_NAME, INDEX_NAME
+;
+
+
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW sql_table_keys AS
+  SELECT 
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    INDEX_NAME,
+    IF(
+      INDEX_NAME='PRIMARY',
+      'DROP PRIMARY KEY',
+      CONCAT('DROP KEY ', mysql_qualify(INDEX_NAME))
+    ) as sql_drop_key,
+    CONCAT('ADD ', sql_index_definition) as sql_add_key
+  FROM 
+    _sql_table_keys
+;
+
+
+
 CREATE OR REPLACE
 ALGORITHM = MERGE
 SQL SECURITY INVOKER
@@ -10216,16 +10650,25 @@ VIEW sql_alter_table AS
     TABLE_SCHEMA,
     TABLE_NAME,
     ENGINE,
+    GROUP_CONCAT(sql_drop_key ORDER BY INDEX_NAME SEPARATOR ', ') AS sql_drop_keys,
+    GROUP_CONCAT(sql_add_key ORDER BY INDEX_NAME  SEPARATOR ', ') AS sql_add_keys,
     CONCAT(
-      'ALTER TABLE `', TABLE_SCHEMA, '`.`', TABLE_NAME, 
-      '` ENGINE=', ENGINE, ' ',
+      'ENGINE=', ENGINE, ' ',
+      IF(CREATE_OPTIONS='partitioned', '', CREATE_OPTIONS)
+    ) AS table_options,
+    CONCAT(
+      'ALTER TABLE ', mysql_qualify(TABLE_SCHEMA), '.', mysql_qualify(TABLE_NAME), 
+      ' ENGINE=', ENGINE, ' ',
       IF(CREATE_OPTIONS='partitioned', '', CREATE_OPTIONS)
     ) AS alter_statement
   FROM 
     INFORMATION_SCHEMA.TABLES
+    JOIN sql_table_keys USING (TABLE_SCHEMA, TABLE_NAME)
   WHERE
     TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'performance_schema')
     AND ENGINE IS NOT NULL
+  GROUP BY
+    TABLE_SCHEMA, TABLE_NAME, ENGINE, CREATE_OPTIONS
 ;
 
 -- 
@@ -10273,6 +10716,12 @@ VIEW _sql_range_partitions_summary AS
     table_schema, 
     table_name, 
     COUNT(*) as count_partitions,
+    SUM(_as_datetime(unquote(PARTITION_DESCRIPTION)) < NOW()) AS count_past_timestamp,
+    SUM(_as_datetime(unquote(PARTITION_DESCRIPTION)) >= NOW()) AS count_future_timestamp,
+    SUM(IF(PARTITION_DESCRIPTION = 'MAXVALUE', 0, _as_datetime(FROM_UNIXTIME(PARTITION_DESCRIPTION)) < NOW())) AS count_past_from_unixtime,
+    SUM(IF(PARTITION_DESCRIPTION = 'MAXVALUE', 0, _as_datetime(FROM_UNIXTIME(PARTITION_DESCRIPTION)) >= NOW())) AS count_future_from_unixtime,
+    SUM(IF(PARTITION_DESCRIPTION = 'MAXVALUE', 0, _as_datetime(FROM_DAYS(PARTITION_DESCRIPTION)) < NOW())) AS count_past_from_days,
+    SUM(IF(PARTITION_DESCRIPTION = 'MAXVALUE', 0, _as_datetime(FROM_DAYS(PARTITION_DESCRIPTION)) >= NOW())) AS count_future_from_days,
     substring_index(group_concat(PARTITION_NAME order by PARTITION_ORDINAL_POSITION), ',', 1) as first_partition_name,
     substring_index(group_concat(IF((PARTITION_ORDINAL_POSITION = 1 and PARTITION_DESCRIPTION = 0), NULL, PARTITION_NAME) order by PARTITION_ORDINAL_POSITION), ',', 1) as first_partition_name_skipping_zero,    
     substring_index(group_concat(PARTITION_NAME order by PARTITION_ORDINAL_POSITION), ',', -1) as last_partition_name,
@@ -10398,7 +10847,19 @@ VIEW _sql_range_partitions_analysis AS
       when diff_day != 0 then max_partition_description + interval diff_day day
       when diff != 0 then max_partition_description + diff
       else NULL
-    end, '.', 1) as next_partition_human_description
+    end, '.', 1) as next_partition_human_description,
+    case
+      when (diff_year_from_unixtime != 0 or diff_month_from_unixtime != 0 or diff_week_from_unixtime or diff_day_from_unixtime != 0) then count_past_from_unixtime
+      when (diff_year_from_days != 0 or diff_month_from_days != 0 or diff_week_from_days != 0 or diff_day_from_days != 0) then count_past_from_days
+      when (diff_year != 0 or diff_month != 0 or diff_week != 0 or diff_day != 0) then count_past_timestamp
+      else NULL
+    end as count_past_partitions,
+    case
+      when (diff_year_from_unixtime != 0 or diff_month_from_unixtime != 0 or diff_week_from_unixtime or diff_day_from_unixtime != 0) then count_future_from_unixtime
+      when (diff_year_from_days != 0 or diff_month_from_days != 0 or diff_week_from_days != 0 or diff_day_from_days != 0) then count_future_from_days
+      when (diff_year != 0 or diff_month != 0 or diff_week != 0 or diff_day != 0) then count_future_timestamp
+      else NULL
+    end as count_future_partitions
   from
     _sql_range_partitions_diff
     join _sql_range_partitions_summary using (table_schema, table_name)
@@ -10436,6 +10897,9 @@ VIEW sql_range_partitions AS
     table_schema,
     table_name,
     count_partitions,
+    count_past_partitions,
+    count_future_partitions,
+    has_maxvalue,
     CONCAT('alter table ', mysql_qualify(table_schema), '.', mysql_qualify(table_name), ' drop partition ', mysql_qualify(first_partition_name_skipping_zero)) as sql_drop_first_partition,
     IF (has_maxvalue,
       CONCAT(
@@ -10581,6 +11045,25 @@ VIEW data_size_per_schema AS
 ;
 
 -- 
+-- Lists routines with rdebug's debugging info    
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW debugged_routines AS
+  SELECT 
+    ROUTINE_SCHEMA,
+    ROUTINE_NAME,
+    ROUTINE_TYPE,
+    CONCAT('call `', DATABASE(), '`.rdebug_compile_routine(', QUOTE(ROUTINE_SCHEMA),', ', QUOTE(ROUTINE_NAME),', false)') AS sql_undebug_routine
+  FROM
+    INFORMATION_SCHEMA.ROUTINES
+  WHERE 
+    locate(_rdebug_get_debug_code_start(), ROUTINE_DEFINITION) > 0;
+;
+
+-- 
 -- Complement INFORMATION_SCHEMA.ROUTINES with missing param_list    
 -- 
 
@@ -10634,8 +11117,26 @@ VIEW _global_status_sleep AS
     SELECT 
       '' AS VARIABLE_NAME, 
       SLEEP(10) 
-    FROM DUAL
+    FROM DUAL 
   )
+;
+
+
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW _global_status_wrapper AS
+  (
+    SELECT VARIABLE_NAME, VARIABLE_VALUE FROM INFORMATION_SCHEMA.GLOBAL_STATUS
+  )
+  UNION ALL
+  (
+    SELECT 
+      '' AS VARIABLE_NAME, 
+      0 
+    FROM DUAL 
+  )
+  
 ;
 
 
@@ -10646,7 +11147,7 @@ CREATE OR REPLACE
 ALGORITHM = MERGE
 SQL SECURITY INVOKER
 VIEW global_status_diff AS
-  SELECT 
+  SELECT STRAIGHT_JOIN
     LOWER(gs0.VARIABLE_NAME) AS variable_name,
     gs0.VARIABLE_VALUE AS variable_value_0,
     gs1.VARIABLE_VALUE AS variable_value_1,
@@ -10655,7 +11156,7 @@ VIEW global_status_diff AS
     (gs1.VARIABLE_VALUE - gs0.VARIABLE_VALUE) * 60 / 10 AS variable_value_pminute
   FROM
     _global_status_sleep AS gs0
-    JOIN INFORMATION_SCHEMA.GLOBAL_STATUS gs1 USING (VARIABLE_NAME)
+    JOIN _global_status_wrapper gs1 USING (VARIABLE_NAME)
 ;
 
 -- 
@@ -10986,6 +11487,70 @@ VIEW slave_status AS
     SUM(IF(is_sql_thread OR (is_system AND NOT is_io_thread), TIME, NULL)) AS Seconds_Behind_Master
   FROM 
     processlist_repl
+;
+
+-- 
+-- Present only QueryScript variables relevant to current session
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW _qs_variables AS
+  SELECT 
+    *
+  FROM
+    _global_qs_variables
+  WHERE
+    session_id = CONNECTION_ID()
+;
+
+-- 
+-- Present only QueryScript report data relevant to current session
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW _script_report_data AS
+  SELECT 
+    *
+  FROM
+    _global_script_report_data
+  WHERE
+    session_id = CONNECTION_ID()
+;
+
+-- 
+-- Present only QueryScript variables relevant to current session
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW _split_column_names_table AS
+  SELECT 
+    *
+  FROM
+    _global_split_column_names_table
+  WHERE
+    session_id = CONNECTION_ID()
+;
+
+-- 
+-- Present only sql_tokens relevant to current session
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW _sql_tokens AS
+  SELECT 
+    *
+  FROM
+    _global_sql_tokens
+  WHERE
+    session_id = CONNECTION_ID()
 ;
 DROP TABLE IF EXISTS `routine_privileges`;
 
@@ -11626,7 +12191,7 @@ create temporary table _security_audit_identical_passwords (
 
 insert into _security_audit_identical_passwords
   SELECT 
-    user, host, password 
+    user, host, MIN(password) AS password 
   FROM (
     SELECT 
       user1.user, user1.host, 
@@ -11802,10 +12367,6 @@ possible to download the documentation as a bundled HTML archive.
 Get it
 
 I''m ready! Take_me_to_Downloads_page
-
-Notes
-
-There is no MySQL 5.0 compatible distribution.
 ');
 		
 			INSERT INTO common_schema.help_content VALUES ('install','common_schema distribution file is a SQL source file. To install it, you
@@ -12661,6 +13222,92 @@ AUTHOR
 Shlomi Noach
 ');
 		
+			INSERT INTO common_schema.help_content VALUES ('charting_routines','
+SYNOPSIS
+
+Charting routines: quick, poor man''s charting of one''s data
+
+* line_chart(): Generate an ASCII multi-line chart based on an arbitrary
+  query.
+* google_line_chart(): Generate a Google Image multi-line chart URL based on
+  an arbitrary query.
+
+
+EXAMPLES
+
+Generate a 2 line sample chart:
+
+
+       mysql> call line_chart("select n, log(n), sin(n/5)+2 from numbers
+       where n > 0 order by n limit 80", "log n, 2 + sin n/5");
+       +---------+-------------------------------------------------------
+       ---------------------------+
+       | y_scale | common_schema_chart
+       |
+       +---------+-------------------------------------------------------
+       ---------------------------+
+       | 4.38    | ------------------------------------------------------
+       ---------------########### |
+       | 4.11    | -----------------------------------------------------
+       ################----------- |
+       | 3.83    | ----------------------------------------#############-
+       -------------------------- |
+       | 3.56    | ------------------------------##########--------------
+       -------------------------- |
+       | 3.29    | -----------------------#######------------------------
+       -------------------------- |
+       | 3.01    | -----*****-------######-------------*****-------------
+       --------------*****------- |
+       | 2.74    | ---**-----**-####-----------------**-----**-----------
+       ------------**-----**----- |
+       | 2.46    | -**-------##**-------------------*---------**---------
+       ----------**---------*---- |
+       | 2.19    | *------###----*----------------**------------*--------
+       ---------*------------**-- |
+       | 1.92    | -----##--------*--------------*---------------**------
+       -------**---------------*- |
+       | 1.64    | ----#-----------**----------**------------------*-----
+       ------*------------------* |
+       | 1.37    | ---#--------------**-------*---------------------**---
+       ----**-------------------- |
+       | 1.10    | --#-----------------*******------------------------
+       *******---------------------- |
+       | 0.82    | -#----------------------------------------------------
+       -------------------------- |
+       | 0.55    | ------------------------------------------------------
+       -------------------------- |
+       | 0.27    | ------------------------------------------------------
+       -------------------------- |
+       | 0.00    | #-----------------------------------------------------
+       -------------------------- |
+       |         |
+       v::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+       v |
+       |         | 1
+       80 |
+       |         |     # log n
+       |
+       |         |     * 2 + sin n/
+       5                                                                |
+       +---------+-------------------------------------------------------
+       ---------------------------+
+
+
+Generate a 2 line sample chart in google image chart URL format:
+
+
+       mysql> call google_line_chart("select n, log(n), sin(n/5)+2 from
+       numbers where n > 0 order by n limit 80", "log n, 2 + sin n/5") \\G
+       *************************** 1. row ***************************
+       google_chart_url: http://chart.apis.google.com/
+       chart?cht=lc&chs=800x350&chtt=SQL+chart+by+common_schema&chxt=x,y&chxr=1,0.0,4.4&chd=s:
+       AKPTWZbdfghjklmnnopqqrssttuuvvwwxxxyyzzz0001112222333444455555666677777888888999,fhkmopqqponljhebYWTRQPOOOQRTVYbdgjlnopqqpomkifcZXUSQPOOOPQSUXacfikmopqqponljgdbY&chxs=0,505050,10,0,lt&chxl=0:
+       |1|||||||||||||||||||20||||||||||||||||||||40||||||||||||||||||||60||||||||||||||||||||80&chg=1.265822784,25,1,2,0,0&chco=ff8c00,4682b4&chdl=log
+       n|2_+_sin_n/5&chdlp=b
+
+
+');
+		
 			INSERT INTO common_schema.help_content VALUES ('crc64','
 NAME
 
@@ -13055,6 +13702,101 @@ MySQL 5.1 or newer
 SEE ALSO
 
 auto_increment_columns, data_size_per_engine
+
+AUTHOR
+
+Shlomi Noach
+');
+		
+			INSERT INTO common_schema.help_content VALUES ('debugged_routines','
+NAME
+
+debugged_routines: List routines with rdebug''s debugging info
+
+TYPE
+
+View
+
+DESCRIPTION
+
+debugged_routines lists those routines that have been compiled_with_debug info
+via rdebug''s_API.
+It also provides with the SQL statement to remove the debug info from the
+routines.
+
+STRUCTURE
+
+
+
+       mysql> DESC debugged_routines;
+       +---------------------+--------------+------+-----+---------+-----
+       --+
+       | Field               | Type         | Null | Key | Default |
+       Extra |
+       +---------------------+--------------+------+-----+---------+-----
+       --+
+       | ROUTINE_SCHEMA      | varchar(64)  | NO   |     |         |
+       |
+       | ROUTINE_NAME        | varchar(64)  | NO   |     |         |
+       |
+       | ROUTINE_TYPE        | varchar(9)   | NO   |     |         |
+       |
+       | sql_undebug_routine | varchar(332) | YES  |     | NULL    |
+       |
+       +---------------------+--------------+------+-----+---------+-----
+       --+
+
+
+
+SYNOPSIS
+
+
+* ROUTINE_SCHEMA: schema of routine
+* ROUTINE_NAME: name of routine with debug info
+* ROUTINE_TYPE: type of routine with debug info (''PROCEDURE'' or ''FUNCTION'')
+* sql_undebug_routine: SQL statement to invoke for removing debug info from
+  routine.
+
+
+EXAMPLES
+
+
+
+       mysql> call rdebug_compile_routine(''test'', ''analyze_continents'',
+       true);
+
+       mysql> call rdebug_compile_routine(''test'',
+       ''analyze_continent_cities'', true);
+
+       mysql> SELECT * FROM debugged_routines;
+       +----------------+--------------------------+--------------+------
+       ------------------------------------------------------------------
+       ----------------+
+       | ROUTINE_SCHEMA | ROUTINE_NAME             | ROUTINE_TYPE |
+       sql_undebug_routine
+       |
+       +----------------+--------------------------+--------------+------
+       ------------------------------------------------------------------
+       ----------------+
+       | test           | analyze_continents       | PROCEDURE    | call
+       `common_schema`.rdebug_compile_routine(''test'',
+       ''analyze_continents'', false)       |
+       | test           | analyze_continent_cities | PROCEDURE    | call
+       `common_schema`.rdebug_compile_routine(''test'',
+       ''analyze_continent_cities'', false) |
+       +----------------+--------------------------+--------------+------
+       ------------------------------------------------------------------
+       ----------------+
+
+
+
+ENVIRONMENT
+
+MySQL 5.1 or newer
+
+SEE ALSO
+
+rdebug_compile_routine(), rdebug_show_routine()
 
 AUTHOR
 
@@ -15483,6 +16225,126 @@ AUTHOR
 Shlomi Noach
 ');
 		
+			INSERT INTO common_schema.help_content VALUES ('google_line_chart','
+NAME
+
+google_line_chart(): Generate a Google Image multi-line chart URL based on an
+arbitrary query.
+
+TYPE
+
+Procedure
+
+DESCRIPTION
+
+Given an arbitrary query, generate a Google Image Chart URL to visualize
+query''s data.
+To make for a compact URL (less than 2048 characters), data values are
+presented with low resolution format, which allows at most 63 distinct values
+on the vertical scale. This makes for non-smooth lines in some cases (See
+EXAMPLES below).
+Even as this procedure was created (2013), Google Image Charts are deprecated,
+yet the service is still running and functional. The service may go down at
+any stage.
+
+SYNOPSIS
+
+
+
+       google_line_chart(
+       	IN values_query TEXT,
+       	IN chart_legend TEXT
+         )
+         READS SQL DATA
+
+
+Input:
+
+* values_query: a query producing data to be visualized. Query columns are
+  assumed as follows:
+
+  o First column makes for "x" values. google_line_chart() will sort the
+    results by first column ascending. The type of this column is arbitrary;
+    it could be numerical, temporal etc.
+  o 2nd [, 3rd [...]] columns are "y" values. You may provide up to 8 data
+    columns, totaling 9 columns together with the first "x" values column.
+
+* chart_legend: comma delimited text, listing the desired legend items. There
+  should be the same number of tokens in this parameter as there are data
+  columns in the query. However, google_line_chart() will work with less that
+  number or more; the result of a nonmatching number is a nonmatching legend.
+
+
+EXAMPLES
+
+Show a simple sine & log computation:
+
+
+       mysql> call google_line_chart("select n, log(n), sin(n/5)+2 from
+       numbers where n > 0 order by n limit 80", "log n, 2 + sin n/5") \\G
+       *************************** 1. row ***************************
+       google_chart_url: http://chart.apis.google.com/
+       chart?cht=lc&chs=800x350&chtt=SQL+chart+by+common_schema&chxt=x,y&chxr=1,0.0,4.4&chd=s:
+       AKPTWZbdfghjklmnnopqqrssttuuvvwwxxxyyzzz0001112222333444455555666677777888888999,fhkmopqqponljhebYWTRQPOOOQRTVYbdgjlnopqqpomkifcZXUSQPOOOPQSUXacfikmopqqponljgdbY&chxs=0,505050,10,0,lt&chxl=0:
+       |1|||||||||||||||||||20||||||||||||||||||||40||||||||||||||||||||60||||||||||||||||||||80&chg=1.265822784,25,1,2,0,0&chco=ff8c00,4682b4&chdl=log
+       n|2_+_sin_n/5&chdlp=b
+
+
+The above leads to this image:  alt="SQL chart by common_schema"/>
+
+ENVIRONMENT
+
+MySQL 5.1 or newer
+
+SEE ALSO
+
+line_chart()
+
+AUTHOR
+
+Shlomi Noach
+');
+		
+			INSERT INTO common_schema.help_content VALUES ('grant_access','
+NAME
+
+grant_access(): Grant SELECT & EXECUTE to all grantees on common_schema
+
+TYPE
+
+Procedure
+
+DESCRIPTION
+
+This is a common_schema meta routine, which grants access on common_schema to
+all existing accounts.
+It will, in particular, grant SELECT and EXECUTE on all tables, views and
+routines in common_schema.
+You may possibly wish to execute this routine after common_schema installation
+so as to allow all accounts access to common_schema.
+
+SYNOPSIS
+
+
+
+       grant_access()
+         MODIFIES SQL DATA
+
+
+
+ENVIRONMENT
+
+MySQL 5.1 or newer
+
+SEE ALSO
+
+duplicate_grantee(), processlist_grantees, sql_accounts
+
+AUTHOR
+
+Shlomi Noach
+');
+		
 			INSERT INTO common_schema.help_content VALUES ('help','
 NAME
 
@@ -17190,6 +18052,129 @@ EXAMPLES
 ENVIRONMENT
 
 MySQL 5.1 or newer
+
+AUTHOR
+
+Shlomi Noach
+');
+		
+			INSERT INTO common_schema.help_content VALUES ('line_chart','
+NAME
+
+line_chart(): Generate an ASCII multi-line chart based on an arbitrary query.
+
+TYPE
+
+Procedure
+
+DESCRIPTION
+
+Given an arbitrary query, generate a poor man''s ASCII multi-line chart
+visualizing query''s data. Visualization includes multi-line plot, x-axis
+extreme values, y-axis approximated values and an optional legend.
+Height of query is currently fixed, and width of query varies by amount of
+returned rows.
+
+SYNOPSIS
+
+
+
+       line_chart(
+       	IN values_query TEXT,
+       	IN chart_legend TEXT
+         )
+         READS SQL DATA
+
+
+Input:
+
+* values_query: a query producing data to be visualized. Query columns are
+  assumed as follows:
+
+  o First column makes for "x" values. line_chart() will sort the results by
+    first column ascending. The type of this column is arbitrary; it could be
+    numerical, temporal etc.
+  o 2nd [, 3rd [...]] columns are "y" values. You may provide up to 8 data
+    columns, totaling 9 columns together with the first "x" values column.
+    Note, however, that due to low ASCII plotting resolution, more columns
+    make for less readable visualization.
+    Values of these columns are expected to be numerical.
+
+* chart_legend: comma delimited text, listing the desired legend items. There
+  should be the same number of tokens in this parameter as there are data
+  columns in the query. However, line_chart() will work with less that number
+  or more; the result of a nonmatching number is a nonmatching legend.
+  You may pass NULL or '''' (empty text) to avoid displaying a legend.
+
+
+EXAMPLES
+
+Show a simple sine & log computation:
+
+
+       mysql> call line_chart("select n, log(n), sin(n/5)+2 from numbers
+       where n > 0 order by n limit 80", "log n, 2 + sin n/5");
+       +---------+-------------------------------------------------------
+       ---------------------------+
+       | y_scale | common_schema_chart
+       |
+       +---------+-------------------------------------------------------
+       ---------------------------+
+       | 4.38    | ------------------------------------------------------
+       ---------------########### |
+       | 4.11    | -----------------------------------------------------
+       ################----------- |
+       | 3.83    | ----------------------------------------#############-
+       -------------------------- |
+       | 3.56    | ------------------------------##########--------------
+       -------------------------- |
+       | 3.29    | -----------------------#######------------------------
+       -------------------------- |
+       | 3.01    | -----*****-------######-------------*****-------------
+       --------------*****------- |
+       | 2.74    | ---**-----**-####-----------------**-----**-----------
+       ------------**-----**----- |
+       | 2.46    | -**-------##**-------------------*---------**---------
+       ----------**---------*---- |
+       | 2.19    | *------###----*----------------**------------*--------
+       ---------*------------**-- |
+       | 1.92    | -----##--------*--------------*---------------**------
+       -------**---------------*- |
+       | 1.64    | ----#-----------**----------**------------------*-----
+       ------*------------------* |
+       | 1.37    | ---#--------------**-------*---------------------**---
+       ----**-------------------- |
+       | 1.10    | --#-----------------*******------------------------
+       *******---------------------- |
+       | 0.82    | -#----------------------------------------------------
+       -------------------------- |
+       | 0.55    | ------------------------------------------------------
+       -------------------------- |
+       | 0.27    | ------------------------------------------------------
+       -------------------------- |
+       | 0.00    | #-----------------------------------------------------
+       -------------------------- |
+       |         |
+       v::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+       v |
+       |         | 1
+       80 |
+       |         |     # log n
+       |
+       |         |     * 2 + sin n/
+       5                                                                |
+       +---------+-------------------------------------------------------
+       ---------------------------+
+
+
+
+ENVIRONMENT
+
+MySQL 5.1 or newer
+
+SEE ALSO
+
+google_line_chart()
 
 AUTHOR
 
@@ -21454,6 +22439,8 @@ statement. These are:
 
 * $split_columns: comma separated list of columns by which the split algorithm
   splits the table.
+* $split_index: name of index used by this split operation (this index implies
+  the names of columns as presented in $split_columns).
 * $split_min: minimum values of $split_columns. This is the starting point for
   the split operation.
 * $split_max: minimum values of $split_columns. This is the ending point for
@@ -21556,17 +22543,31 @@ own, and does not require instruction. However, the user is given the choice
 of fine tuning split''s operation by providing any combination of the following
 paramaters:
 
-* size: number of rows used in each step (minimum: 100; maximum: 10,000;
+* size: number of rows used in each step (minimum: 100; maximum: 50,000;
   default: 1,000)
-* start: in the specific case where the operation utilizes a single column for
-  splitting (as will be the case for the common AUTO_INCREMENT PRIMARY KEYs),
-  the operation will only begin with given value (inclusive).
-  An error is thrown when the splitting key uses two columns or more.
+* start: starting point for the split operation. This is a comma delimited
+  list of values (quoted on multiple values).
+  The count of values must match the number of columns in the index picked by
+  split. Thus, if split picks an AUTO_INCREMENT PRIMARY KEY for the operation,
+  the value is merely a single integer.
+  Compound values such as ''2013-07-05,12,smith'' are valid.
+  Values do not have to strictly exist in the table: the split operation will
+  begin as of these values, meaning starting at the first row with these exact
+  values or larger.
+  An error is thrown when the number of values specified does not match the
+  number of columns covered by the splitting key.
   All data types are supported, including textual.
-* stop: in the specific case where the operation utilizes a single column for
-  splitting (as will be the case for the common AUTO_INCREMENT PRIMARY KEYs),
-  the operation will terminate with given value (inclusive).
-  An error is thrown when the splitting key uses two columns or more.
+* stop: ending point for the split operation. This is a comma delimited list
+  of values (quoted on multiple values).
+  The count of values must match the number of columns in the index picked by
+  split. Thus, if split picks an AUTO_INCREMENT PRIMARY KEY for the operation,
+  the value is merely a single integer.
+  Compound values such as ''2013-07-05,12,smith'' are valid.
+  Values do not have to strictly exist in the table: the split operation will
+  run up to these values, meaning stopping at the first row with these exact
+  values and excluding any larger.
+  An error is thrown when the number of values specified does not match the
+  number of columns covered by the splitting key.
   All data types are supported, including textual.
 * table: explicit table & schema name, when multiple statements are used. This
   parameter is not required, though allowed, when the statement operates on a
@@ -21577,13 +22578,31 @@ column called rental_id. The split operation starts with rental_id value of
 1200, works till the end of table, and uses chunks of 500 rows at a time.
 
 
-       split ({start: 1200, step: 500} : DELETE FROM sakila.rental WHERE
+       split ({start: 1200, size: 500} : DELETE FROM sakila.rental WHERE
        rental_date < NOW() - INTERVAL 5 YEAR)
          throttle 2;
 
 
 In the above example, the user builds the splitting of the DELETE query
 manually.
+The following example shows how to use the start parameter in the case of a
+compound key. The film_actor table has a compound PRIMARY KEY on
+(`actor_id`,`film_id`). The split operation starts with actor_id = 12 &
+film_id = 631.
+
+
+       split({start:''12,631''} : UPDATE sakila.film_actor set
+       last_update=NOW())
+         throttle 2;
+
+
+In the above the values ''12,631'' are quoted: quotes must be added for multiple
+values; they are allowed but not required on single values (as can be seen on
+the previous example).
+Since there is no limitation on the type of columns, it is possible that they
+are textual. The case where you would have a comma (",") in one of your start/
+stop column values is not supported; any comma is interpreted as a columns
+separator.
 
 LIMITATIONS
 
@@ -22816,6 +23835,10 @@ Verbose, metadata:
 * rdebug_verbose(): Invoke dump of worker''s status: stack, variables,
   statement
 
+Views:
+
+* debugged_routines: List routines with rdebug''s debugging info.
+
 
 SEE ALSO
 
@@ -23426,8 +24449,8 @@ MySQL 5.1 or newer
 
 SEE ALSO
 
-rdebug_compile_routine(), rdebug_run(), rdebug_set_breakpoint(),
-rdebug_show_routine_statements()
+debugged_routines, rdebug_compile_routine(), rdebug_run(),
+rdebug_set_breakpoint(), rdebug_show_routine_statements()
 
 AUTHOR
 
@@ -25659,6 +26682,8 @@ information.
 
 * duplicate_grantee(): Create new account (grantee), identical to given
   account.
+* grant_access(): (META) Grant SELECT & EXECUTE to all grantees on
+  common_schema.
 * killall(): Kill connections with by matching GRANTEE, user or host.
 * match_grantee(): Match an existing account based on user+host.
 * mysql_grantee(): Return a qualified MySQL grantee (account) based on user
@@ -26518,11 +27543,12 @@ View
 DESCRIPTION
 
 sql_alter_table provides with SQL statements to alter a table to its current
-form in terms of engine and create options.
-This view is useful in generating a "resurrection" script to restore table to
-its current engine state. For example, it may provide with the rollback script
-for a database migration from MyISAM to InnoDB, or from InnoDB Antelope to
-Barracuda format.
+form.
+This view analyzes table structure and provides with the syntax required to
+rebuild the table by various aspects. It can be useful in generating a
+"resurrection" script to restore table to its current engine or indexes state.
+For example, it may provide with the rollback script for a database migration
+from MyISAM to InnoDB, or from InnoDB Antelope to Barracuda format.
 
 STRUCTURE
 
@@ -26535,7 +27561,10 @@ STRUCTURE
        | TABLE_SCHEMA    | varchar(64)  | NO   |     |         |       |
        | TABLE_NAME      | varchar(64)  | NO   |     |         |       |
        | ENGINE          | varchar(64)  | YES  |     | NULL    |       |
-       | alter_statement | varchar(473) | YES  |     | NULL    |       |
+       | sql_drop_keys   | longtext     | YES  |     | NULL    |       |
+       | sql_add_keys    | longblob     | YES  |     | NULL    |       |
+       | table_options   | varchar(327) | YES  |     | NULL    |       |
+       | alter_statement | varchar(511) | YES  |     | NULL    |       |
        +-----------------+--------------+------+-----+---------+-------+
 
 
@@ -26547,9 +27576,12 @@ Columns of this view:
 * TABLE_SCHEMA: schema of current table
 * TABLE_NAME: current table name
 * ENGINE: current engine name
+* sql_drop_keys: A SQL statement to drop all keys on table.
+* sql_add_keys: A SQL statement to create all keys on table
+* table_options: All table options for this table
 * alter_statement: A SQL statement which ALTERs current table to its current
-  engine with create-options.
-  Use with eval() to apply query.
+  engine with create options.
+  Use eval() to apply SQL columns.
 
 The SQL statements are not terminated by '';''.
 
@@ -26558,8 +27590,8 @@ EXAMPLES
 Generate ALTER TABLE statements for `sakila` tables:
 
 
-       mysql> SELECT * FROM common_schema.sql_alter_table WHERE
-       TABLE_SCHEMA=''sakila'';
+       mysql> SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, alter_statement
+       FROM common_schema.sql_alter_table WHERE TABLE_SCHEMA=''sakila'';
        +--------------+---------------+--------+-------------------------
        ----------------------------+
        | TABLE_SCHEMA | TABLE_NAME    | ENGINE | alter_statement
@@ -26610,8 +27642,8 @@ Modify tables; again generate ALTER TABLE statements for `sakila` tables:
        mysql> ALTER TABLE sakila.film_category ENGINE=InnoDB
        ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8;
 
-       mysql> SELECT * FROM common_schema.sql_alter_table WHERE
-       TABLE_SCHEMA=''sakila'';
+       mysql> SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, alter_statement
+       FROM common_schema.sql_alter_table WHERE TABLE_SCHEMA=''sakila'';
        +--------------+---------------+--------+-------------------------
        ------------------------------------------------------------------
        +
@@ -26675,6 +27707,25 @@ Modify tables; again generate ALTER TABLE statements for `sakila` tables:
 
 Note again that the SQL statements are not terminated by '';''. Either CONCAT()
 these beforehand, or use sed/awk afterwards.
+Show indexes DROP and ADD statements for a given table:
+
+
+       mysql> SELECT TABLE_SCHEMA, TABLE_NAME, sql_drop_keys,
+       sql_add_keys FROM common_schema.sql_alter_table WHERE
+       TABLE_SCHEMA=''sakila'' and TABLE_NAME=''rental'' \\G
+
+        TABLE_SCHEMA: sakila
+          TABLE_NAME: rental
+       sql_drop_keys: DROP KEY `idx_fk_customer_id`, DROP KEY
+       `idx_fk_inventory_id`, DROP KEY `idx_fk_staff_id`, DROP PRIMARY
+       KEY, DROP KEY `rental_date`
+        sql_add_keys: ADD KEY `idx_fk_customer_id`(`customer_id`), ADD
+       KEY `idx_fk_inventory_id`(`inventory_id`), ADD KEY
+       `idx_fk_staff_id`(`staff_id`), ADD PRIMARY KEY (`rental_id`), ADD
+       UNIQUE KEY `rental_date`
+       (`rental_date`,`inventory_id`,`customer_id`)
+
+
 
 ENVIRONMENT
 
@@ -27153,24 +28204,30 @@ STRUCTURE
 
 
 
-       mysql> DESC common_schema.sql_range_partitions;
-       +--------------------------+--------------+------+-----+---------
+       mysql> DESC sql_range_partitions;
+       +--------------------------+---------------+------+-----+---------
        +-------+
-       | Field                    | Type         | Null | Key | Default |
-       Extra |
-       +--------------------------+--------------+------+-----+---------
+       | Field                    | Type          | Null | Key | Default
+       | Extra |
+       +--------------------------+---------------+------+-----+---------
        +-------+
-       | table_schema             | varchar(64)  | NO   |     |         |
-       |
-       | table_name               | varchar(64)  | NO   |     |         |
-       |
-       | count_partitions         | bigint(21)   | NO   |     | 0       |
-       |
-       | sql_drop_first_partition | varchar(284) | YES  |     | NULL    |
-       |
-       | sql_add_next_partition   | longblob     | YES  |     | NULL    |
-       |
-       +--------------------------+--------------+------+-----+---------
+       | table_schema             | varchar(64)   | NO   |     |
+       |       |
+       | table_name               | varchar(64)   | NO   |     |
+       |       |
+       | count_partitions         | bigint(21)    | NO   |     | 0
+       |       |
+       | count_past_partitions    | decimal(23,0) | YES  |     | NULL
+       |       |
+       | count_future_partitions  | decimal(23,0) | YES  |     | NULL
+       |       |
+       | has_maxvalue             | decimal(23,0) | YES  |     | NULL
+       |       |
+       | sql_drop_first_partition | varchar(284)  | YES  |     | NULL
+       |       |
+       | sql_add_next_partition   | longblob      | YES  |     | NULL
+       |       |
+       +--------------------------+---------------+------+-----+---------
        +-------+
 
 
@@ -27182,6 +28239,13 @@ Columns of this view:
 * table_schema: schema of partitioned table table
 * table_name: table partitioned by RANGE or RANGE COLUMNS
 * count_partitions: number of partitions in table
+* count_past_partitions: in the case partitions are recognized to be by some
+  temporal representation, the number of partitions that are in the past.
+* count_future_partitions: in the case partitions are recognized to be by some
+  temporal representation, the number of partitions that are in the future
+  (including NOW).
+* has_maxvalue: 1 is the table has a LESS THAN MAXVALUE partition, 0
+  otherwise.
 * sql_drop_first_partition: A SQL statement which drops the first partition.
   Use with eval() to apply query.
 * sql_add_next_partition: A SQL statement which adds the "next in sequence"
@@ -27223,6 +28287,9 @@ partition:
                    table_schema: test
                      table_name: quarterly_report_status
                count_partitions: 7
+          count_past_partitions: 6
+        count_future_partitions: 0
+                   has_maxvalue: 1
        sql_drop_first_partition: alter table
        `test`.`quarterly_report_status` drop partition `p0`
          sql_add_next_partition: alter table
@@ -27232,6 +28299,11 @@ partition:
        MAXVALUE)
 
 
+The above query was issued in the year 2013, and so all partitions are
+considered as in the past. The MAXVALUE partition is considered neither as
+past nor future (although it will contain any future rows). This is so that
+count_future_partitions makes for the number of partitions strictly specifying
+future dates.
 Add next partition:
 
 
@@ -27245,7 +28317,7 @@ Add next partition:
          `report_status` varchar(20) NOT NULL,
          `report_updated` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON
        UPDATE CURRENT_TIMESTAMP
-       ) ENGINE=MyISAM DEFAULT CHARSET=latin1
+       ) ENGINE=MyISAM DEFAULT CHARSET=utf8
        /*!50100 PARTITION BY RANGE (UNIX_TIMESTAMP(report_updated))
        (PARTITION p0 VALUES LESS THAN (1199138400) ENGINE = MyISAM,
         PARTITION p1 VALUES LESS THAN (1206997200) ENGINE = MyISAM,

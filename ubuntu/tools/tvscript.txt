@@ -1,0 +1,28 @@
+Credits:  http://www.tejasbarot.com/2013/03/15/custom-init-boot-script-for-teamviewerd-service-for-teamviewer-8-ubuntu-centos-rhel/#axzz2ZEFURLyQ
+
+
+Usage of the script :- /etc/init.d/tvscript {start|stop|restart|status}
+
+BUGS :- Do not rename this script as teamviewer or teamviewerd else it won’t work as expected.
+
+For Ubuntu :-
+
+1. You need to be root or any user with root rights.
+
+2. Download the Script from below link :-
+
+root@linux-support-ahmedabad-tejas-barot:~# wget -c http://www.tejasbarot.com/Scripts/tvscript.sh
+
+3. Now Copy that Script to /etc/init.d/ and assign permissions
+
+root@linux-support-ahmedabad-tejas-barot:~# cp tvscript.sh /etc/init.d/tvscript
+
+root@linux-support-ahmedabad-tejas-barot:~# chmod 0755 /etc/init.d/tvscript
+
+4. Now Let’s Update it as a Custom Init Script ( Boot Script )
+
+root@linux-support-ahmedabad-tejas-barot:~# update-rc.d tvscript defaults
+
+5. That’s It. Now You can use this script by /etc/init.d/tvscript or By rebooting your system.
+
+

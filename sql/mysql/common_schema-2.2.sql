@@ -79,10 +79,13 @@ set @common_schema_innodb_plugin_expected := 0;
 set @common_schema_innodb_plugin_installed := 0;
 set @common_schema_percona_server_expected := 0;
 set @common_schema_percona_server_installed := 0;
+set @common_schema_tokudb_expected := 0;
+set @common_schema_tokudb_installed := 0;
 
 DROP TABLE IF EXISTS _global_qs_variables;
 
 create table _global_qs_variables(
+    server_id int unsigned not null,
     session_id int unsigned not null,
     variable_name VARCHAR(65) CHARSET ascii NOT NULL,
     mapped_user_defined_variable_name  VARCHAR(65) CHARSET ascii NOT NULL,
@@ -90,7 +93,7 @@ create table _global_qs_variables(
     declaration_id INT UNSIGNED NOT NULL,
     scope_end_id INT UNSIGNED NOT NULL,
     value_snapshot TEXT DEFAULT NULL,
-    PRIMARY KEY(session_id, variable_name),
+    PRIMARY KEY(server_id, session_id, variable_name),
     KEY(declaration_depth),
     KEY(declaration_id),
     KEY(scope_end_id)
@@ -99,16 +102,18 @@ create table _global_qs_variables(
 DROP TABLE IF EXISTS _global_script_report_data;
 
 create table _global_script_report_data(
-    id int unsigned AUTO_INCREMENT,
+    id bigint unsigned AUTO_INCREMENT,
     info text charset utf8,
+    server_id int unsigned not null,
     session_id int unsigned not null,
-    PRIMARY KEY (id),
-    KEY (session_id)
+    PRIMARY KEY (id, server_id, session_id),
+    KEY (server_id, session_id)
 ) ENGINE=InnoDB ;
 
 DROP TABLE IF EXISTS _global_split_column_names_table;
 
 create table _global_split_column_names_table(
+    server_id int unsigned not null,
     session_id int unsigned not null,
     column_order TINYINT UNSIGNED,
     split_table_name varchar(128) charset utf8,
@@ -118,19 +123,20 @@ create table _global_split_column_names_table(
     max_variable_name VARCHAR(128) charset utf8,
     range_start_variable_name VARCHAR(128) charset utf8,
     range_end_variable_name VARCHAR(128) charset utf8,
-    PRIMARY KEY(session_id, column_order)
+    PRIMARY KEY(server_id, session_id, column_order)
 ) ENGINE=InnoDB ;
 
 DROP TABLE IF EXISTS _global_sql_tokens;
 
 CREATE TABLE _global_sql_tokens (
-    session_id int unsigned
+    server_id int unsigned not null
+  , session_id int unsigned
   , id int unsigned
   , start int unsigned  not null
   , level int not null
   , token text          
   , state text not null
-  , PRIMARY KEY(session_id, id)
+  , PRIMARY KEY(server_id, session_id, id)
 ) ENGINE=InnoDB ;
 
 DROP TABLE IF EXISTS _known_thread_states;
@@ -402,8 +408,8 @@ A copy of the GNU General Public License is available at
   ('project_home', 'http://code.google.com/p/common-schema/'),
   ('project_repository', 'https://common-schema.googlecode.com/svn/trunk/'),
   ('project_repository_type', 'svn'),
-  ('revision', '496'),
-  ('version', '2.1')
+  ('revision', '523'),
+  ('version', '2.2')
 ;  
 -- 
 -- Utility table: unsigned integers, [0..4095]
@@ -3477,10 +3483,15 @@ language SQL
 deterministic
 no sql
 sql security invoker
-begin
+main_body: begin
   declare error_statement VARCHAR(1500) CHARSET utf8;
 
   set @common_schema_error := error_message;
+  /*!50500
+  SET @common_schema_error := LEFT(@common_schema_error, 128);
+  SIGNAL SQLSTATE VALUE '91100' SET MESSAGE_TEXT = @common_schema_error;
+   */
+  -- MySQL 5.1 does not support SIGNAL. Fallback:
   set error_statement := CONCAT('SELECT error FROM error.`', error_message, '`');
   call exec_single(error_statement);
 end;
@@ -3882,6 +3893,7 @@ create procedure _get_json_token(
                         ,   'error'
                         ,   'integer'
                         ,   'number'
+                        ,   'minus'
                         ,   'object_begin'
                         ,   'object_end'
                         ,   'array_begin'
@@ -3900,6 +3912,7 @@ begin
     declare v_length int unsigned default character_length(p_text);
     declare v_char, v_lookahead, v_quote_char    varchar(1) charset utf8;
     declare v_from int unsigned;
+    declare negative_number bool default false;
 
     if p_from is null then
         set p_from = 1;
@@ -3921,12 +3934,18 @@ begin
         set v_char = substr(p_text, v_from, 1)
         ,   v_lookahead = substr(p_text, v_from+1, 1)
         ;
+        if v_char = '-' then
+            set negative_number := true, v_from = v_from + 1;
+            iterate my_loop;
+        end if;
         state_case: begin case p_state
             when 'error' then 
                 set p_from = v_length;
                 leave state_case;            
             when 'start' then
                 case
+                    when v_char = '-' then
+                        set p_state = 'minus', v_from = v_from + 1;
                     when v_char between '0' and '9' then 
                         set p_state = 'integer';
                     when v_char between 'A' and 'Z' 
@@ -4037,10 +4056,30 @@ begin
     if p_state = 'alphanum' then
       set p_state := 'alpha';
     end if;
+    if negative_number and (p_state != 'number') then
+    	set p_token := NULL;
+    end if;
 end;
 //
 
 delimiter ;
+-- 
+-- return the @@server_id (to be used from within views)
+-- 
+
+DELIMITER $$
+
+DROP FUNCTION IF EXISTS _get_server_id $$
+CREATE FUNCTION _get_server_id() RETURNS INT UNSIGNED 
+READS SQL DATA
+SQL SECURITY INVOKER
+COMMENT 'Return current server id'
+
+BEGIN
+  RETURN @@global.server_id;
+END $$
+
+DELIMITER ;
 delimiter //
 
 set names utf8
@@ -4066,7 +4105,7 @@ create procedure _get_sql_token(
                         ,   'bitwise not'
                         ,   'bitwise xor'
                         ,   'colon'
-                        ,   'comma'                        
+                        ,   'comma'
                         ,   'conditional comment'
                         ,   'decimal'
                         ,   'delimiter'
@@ -4077,6 +4116,7 @@ create procedure _get_sql_token(
                         ,   'greater than'
                         ,   'greater than or equals'
                         ,   'integer'
+                        ,   'label'
                         ,   'left braces'
                         ,   'left parenthesis'
                         ,   'left shift'
@@ -4086,7 +4126,6 @@ create procedure _get_sql_token(
                         ,   'modulo'
                         ,   'multi line comment'
                         ,   'multiply'
-                        ,   'negate'
                         ,   'not equals'
                         ,   'null safe equals'
                         ,   'or'
@@ -4102,23 +4141,23 @@ create procedure _get_sql_token(
                         ,   'system variable'
                         ,   'user-defined variable'
                         ,   'query_script variable'
-                        ,	'expanded query_script variable'
+                        ,   'expanded query_script variable'
                         ,   'whitespace'
                         ,   'not'
-                        )               
+                        )
 )
 comment 'Reads a token according to lexical rules for SQL'
 language SQL
 deterministic
 no sql
 sql security invoker
-begin    
+begin
     declare v_length int unsigned default character_length(p_text);
     declare v_no_ansi_quotes        bool default find_in_set('ANSI_QUOTES', @@sql_mode) = FALSE;
     declare v_char, v_lookahead, v_quote_char    char(1) charset utf8;
     declare v_from int unsigned;
     declare allow_script_tokens tinyint unsigned;
-    
+
     set allow_script_tokens := (language_mode = 'script');
 
     if p_from is null then
@@ -4134,31 +4173,33 @@ begin
         set p_level = p_level - 1;
     end if;
     set v_from = p_from;
-    
+
     set p_token = ''
     ,   p_state = 'start';
+
     my_loop: while v_from <= v_length do
         set v_char = substr(p_text, v_from, 1)
         ,   v_lookahead = substr(p_text, v_from+1, 1)
         ;
+
         state_case: begin case p_state
-            when 'error' then 
+            when 'error' then
                 set p_from = v_length;
-                leave state_case;            
+                leave state_case;
             when 'start' then
                 case
-                    when v_char between '0' and '9' then 
+                    when v_char between '0' and '9' then
                         set p_state = 'integer';
-                    when v_char between 'A' and 'Z' 
-                    or   v_char between 'a' and 'z' 
+                    when v_char between 'A' and 'Z'
+                    or   v_char between 'a' and 'z'
                     or   v_char = '_' then
-                        set p_state = 'alpha';                        
-                    when v_char = ' ' then 
+                        set p_state = 'alpha';
+                    when v_char = ' ' then
                         set p_state = 'whitespace'
                         ,   v_from = v_length - character_length(ltrim(substring(p_text, v_from)))
                         ;
                         leave state_case;
-                    when v_char in ('\t', '\n', '\r') then 
+                    when v_char in ('\t', '\n', '\r') then
                         set p_state = 'whitespace';
                     when v_char = '''' or v_no_ansi_quotes and v_char = '"' then
                         set p_state = 'string', v_quote_char = v_char;
@@ -4214,7 +4255,7 @@ begin
                             leave my_loop;
                         end if;
                     when v_char = '-' then
-                        case 
+                        case
                             when v_lookahead = '-' and substr(p_text, v_from + 2, 1) = ' ' then
                                 set p_state = 'single line comment'
                                 ,   v_from = locate('\n', p_text, p_from)
@@ -4240,11 +4281,11 @@ begin
                     when v_char = '+' then
                         set p_state = 'plus', v_from = v_from + 1;
                         leave my_loop;
-                    when v_char = '<' then 
+                    when v_char = '<' then
                         set p_state = 'less than';
-                    when v_char = '>' then 
+                    when v_char = '>' then
                         set p_state = 'greater than';
-                    when v_char = ':' then 
+                    when v_char = ':' then
                         if v_lookahead = '=' then
                             set p_state = 'assign', v_from = v_from + 2;
                             leave my_loop;
@@ -4254,22 +4295,22 @@ begin
                             set p_state = 'colon', v_from = v_from + 1;
                             leave my_loop;
                         end if;
-                    when v_char = '{' and allow_script_tokens then 
+                    when v_char = '{' and allow_script_tokens then
                         set p_state = 'left braces', v_from = v_from + 1, p_level = p_level + 1;
                         leave my_loop;
-                    when v_char = '}' and allow_script_tokens then 
+                    when v_char = '}' and allow_script_tokens then
                         set p_state = 'right braces', v_from = v_from + 1;
                         leave my_loop;
-                    when v_char = '(' then 
+                    when v_char = '(' then
                         set p_state = 'left parenthesis', v_from = v_from + 1, p_level = p_level + 1;
                         leave my_loop;
-                    when v_char = ')' then 
+                    when v_char = ')' then
                         set p_state = 'right parenthesis', v_from = v_from + 1;
                         leave my_loop;
-                    when v_char = '^' then 
+                    when v_char = '^' then
                         set p_state = 'bitwise xor', v_from = v_from + 1;
                         leave my_loop;
-                    when v_char = '~' then 
+                    when v_char = '~' then
                         set p_state = 'bitwise not', v_from = v_from + 1;
                         leave my_loop;
                     when v_char = '!' then
@@ -4293,34 +4334,34 @@ begin
                             set p_state = 'bitwise and', v_from = v_from + 1;
                         end if;
                         leave my_loop;
-                    else 
+                    else
                         set p_state = 'error';
                 end case;
             when 'less than' then
-                case v_char 
-                    when '=' then 
+                case v_char
+                    when '=' then
                         set p_state = 'less than or equals';
                         leave state_case;
-                    when '>' then 
+                    when '>' then
                         set p_state = 'not equals';
-                    when '<' then 
+                    when '<' then
                         set p_state = 'left shift';
                     else
                         do null;
                 end case;
                 leave my_loop;
             when 'less than or equals' then
-                if v_char = '>' then 
+                if v_char = '>' then
                     set p_state = 'null safe equals'
                     ,   v_from = v_from + 1
                     ;
                 end if;
                 leave my_loop;
             when 'greater than' then
-                case v_char 
-                    when '=' then 
+                case v_char
+                    when '=' then
                         set p_state = 'greater than or equals';
-                    when '>' then 
+                    when '>' then
                         set p_state = 'right shift';
                     else
                         set p_state = 'error';
@@ -4331,67 +4372,117 @@ begin
                     set v_from = v_from + 2;
                     leave my_loop;
                 end if;
-            when 'alpha' then 
+            when 'alpha' then
                 case
-                    when v_char between 'A' and 'Z' 
-                    or   v_char between 'a' and 'z' 
+                    when v_char between 'A' and 'Z'
+                    or   v_char between 'a' and 'z'
                     or   v_char = '_' then
                         leave state_case;
-                    when v_char between '0' and '9' 
-                    or   v_char = '$' then 
+                    when v_char between '0' and '9'
+                    or   v_char = '$' then
                         set p_state = 'alphanum';
                     else
+--                        if v_char = ':' and v_lookahead not in ('=', '$') then
+--                          set p_state = 'label', v_from = v_from + 1;
+--                        end if;
                         leave my_loop;
                 end case;
-            when 'alphanum' then 
+            when 'alphanum' then
                 case
-                    when v_char between 'A' and 'Z' 
-                    or   v_char between 'a' and 'z' 
+                    when v_char between 'A' and 'Z'
+                    or   v_char between 'a' and 'z'
                     or   v_char = '_'
-                    or   v_char between '0' and '9' then 
+                    or   v_char between '0' and '9' then
                         leave state_case;
                     else
+--                        if v_char = ':' and v_lookahead not in ('=', '$') then
+--                          set p_state = 'label', v_from = v_from + 1;
+--                        end if;
                         leave my_loop;
                 end case;
             when 'integer' then
-                case 
-                    when v_char between '0' and '9' then 
+                case
+                    when v_char between '0' and '9' then
                         leave state_case;
-                    when v_char = '.' then 
+                    when v_char = '.' then
                         set p_state = 'decimal';
                     else
-                        leave my_loop;                        
+                        leave my_loop;
                 end case;
             when 'decimal' then
-                case 
-                    when v_char between '0' and '9' then 
+                case
+                    when v_char between '0' and '9' then
                         leave state_case;
                     else
                         leave my_loop;
                 end case;
             when 'whitespace' then
                 if v_char not in ('\t', '\n', '\r') then
-                    leave my_loop;                        
+                    leave my_loop;
                 end if;
             when 'string' then
+                -- find the closing quote
                 set v_from = locate(v_quote_char, p_text, v_from);
-                if v_from then
+                if v_from then  -- found a closing quote
+                    if substr(p_text, v_from - 1, 1) = '\\' then
+                        -- this quote was preceded by a backslash.
+                        -- we now have to figure out if this was an escaping backslash.
+                        backslahses: begin
+                            declare v_backslash int unsigned default v_from - 2;
+                            while substr(p_text, v_backslash, 1) = '\\' do
+                                -- we found 2 consecutive backslashes.
+                                -- see if there are even more:
+                                if substr(p_text, v_backslash - 1, 1) = '\\' then
+                                    -- more backslashes, continue the loop.
+                                    set v_backslash = v_backslash - 2;
+                                else
+                                    -- no more backslases.
+                                    -- The quote was not escaped by a backslash.
+                                    leave backslahses;
+                                end if;
+                            end while;
+                            -- if we arrive here, the backslash escaped the quote.
+                            -- this means we haven't found the end of the string yet.
+                            -- so, we have to look beyond the quote for a new one.
+                            set v_from = v_from + 1;
+                            if v_from > v_length then
+                                set p_state = 'error';
+                                leave my_loop;
+                            else
+                                iterate my_loop;
+                            end if;
+                        end backslahses;
+                    end if;
+
+                    -- by now we established that the quote was not escaped by a preceding backslash.
+                    -- but it could still be escaped by a following quote char.
                     if substr(p_text, v_from + 1, 1) = v_quote_char then
-                        set v_from = v_from + 1;
-                    elseif substr(p_text, v_from - 1, 1) != '\\' then
+                        -- this quote is followed by the same quote,
+                        -- this means it was an escaped quote.
+                        -- so, continue beyond this point to find the real end of the string.
+                        set v_from = v_from + 2;
+                        if v_from > v_length then
+                            set p_state = 'error';
+                            leave my_loop;
+                        else
+                            iterate my_loop;
+                        end if;
+                    else
+                        -- ok, this quote appears to be the real end of the string.
+                        -- leave to produce the string token.
                         set v_from = v_from + 1;
                         leave my_loop;
                     end if;
-                else
-                    set p_state = 'error';
+                else  -- no closing quote found. This must be an error.
+                    set p_state = 'error', v_from = v_length;
                     leave my_loop;
                 end if;
             when 'quoted identifier' then
-                if v_char != v_quote_char then 
+                if v_char != v_quote_char then
                     leave state_case;
                 else
                     set v_from = v_from + 1;
-                    leave my_loop;                
+                    leave my_loop;
                 end if;
             when 'user-defined variable' then
                 if v_char in (';', ',', ' ', '\t', '\n', '\r', '!', '~', '^', '%', '>', '<', ':', '=', '+', '-', '&', '*', '|', '(', ')') then
@@ -4418,7 +4509,7 @@ begin
                     leave my_loop;
                 end if;
             else
-                leave my_loop;            
+                leave my_loop;
         end case; end state_case;
         set v_from = v_from + 1;
     end while my_loop;
@@ -5323,6 +5414,99 @@ BEGIN
 END $$
 
 DELIMITER ;
+
+--
+-- Rotate a table logrotate-style: version current table and move aside,
+-- pushing older versions further down the line, 
+--
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS table_rotate $$
+CREATE PROCEDURE table_rotate(
+    IN table_schema varchar(64) charset utf8, 
+    IN table_name varchar(64) charset utf8,
+    IN rotate_limit smallint unsigned
+  ) 
+MODIFIES SQL DATA
+SQL SECURITY INVOKER
+COMMENT 'Rotate a table logrotate-style'
+
+begin
+  declare rotate_index smallint unsigned;
+  declare rotate_statement TEXT charset utf8 default null;
+    
+  if not table_exists(table_schema, table_name) then
+    call throw(concat('Cannot rotate non-existing table: ', mysql_qualify(table_schema), '.', mysql_qualify(table_name)));
+  end if;
+ 
+  if IFNULL(rotate_limit, 0) > 0 then
+    -- drop oldest:
+    set rotate_statement := concat(
+        'DROP TABLE IF EXISTS ', 
+        mysql_qualify(table_schema), '.', mysql_qualify(concat(table_name, '__', rotate_limit))
+    );  
+    call exec(rotate_statement);
+  end if;
+  
+  -- create empty table:
+  set rotate_statement := concat(
+      'CREATE TABLE ', 
+      mysql_qualify(table_schema), '.', mysql_qualify(concat(table_name, '__0')), ' LIKE ',
+      mysql_qualify(table_schema), '.', mysql_qualify(table_name)
+  );  
+  call exec(rotate_statement);
+ 
+  -- rotate all tables:
+  set rotate_statement := '';
+  set rotate_index := 1;
+  while table_exists(table_schema, concat(table_name, '__', rotate_index)) do
+    set rotate_statement := concat(
+        mysql_qualify(table_schema), '.', mysql_qualify(concat(table_name, '__', rotate_index)),
+          ' TO ', mysql_qualify(table_schema), '.', mysql_qualify(concat(table_name, '__', rotate_index+1)),
+        ', ', rotate_statement
+      );
+    set rotate_index := rotate_index + 1;
+  end while;
+  set rotate_statement := concat(
+      'RENAME TABLE ', rotate_statement, 
+      mysql_qualify(table_schema), '.', mysql_qualify(table_name),
+        ' TO ', mysql_qualify(table_schema), '.', mysql_qualify(concat(table_name, '__', 1)),
+      ', ',
+      mysql_qualify(table_schema), '.', mysql_qualify(concat(table_name, '__0')),
+        ' TO ', mysql_qualify(table_schema), '.', mysql_qualify(table_name)
+    );
+  
+  call exec(rotate_statement);
+end $$
+
+DELIMITER ;
+--
+--
+--
+
+delimiter //
+
+drop procedure if exists _cleanup_script_tables//
+
+create procedure _cleanup_script_tables()
+comment '...'
+language SQL
+deterministic
+modifies sql data
+sql security invoker
+
+main_body: begin
+  if not (@query_script_skip_cleanup is true) then
+    delete from _sql_tokens;
+    delete from _qs_variables;
+    delete from _script_report_data;
+    delete from _split_column_names_table;
+  end if;
+end;
+//
+
+delimiter ;
 --
 --
 --
@@ -6225,8 +6409,8 @@ begin
         set v_old_from = v_from;
         call _get_sql_token(p_text, v_from, v_level, v_token, 'script', v_state);
         set _sql_tokens_id := _sql_tokens_id + 1;
-        insert into _sql_tokens(session_id,id,start,level,token,state) 
-        values (CONNECTION_ID(),_sql_tokens_id, v_from, v_level, v_token, v_state);
+        insert into _sql_tokens(server_id, session_id, id, start, level, token, state) 
+        values (_get_server_id(), CONNECTION_ID(), _sql_tokens_id, v_from, v_level, v_token, v_state);
     until 
         v_old_from = v_from
     end repeat;
@@ -6268,6 +6452,13 @@ main_body: begin
   declare num_expanded_variables_ids int unsigned;
   declare expanded_variable_index int unsigned;
   declare current_expanded_variable_id int unsigned;
+  /*!50500
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    BEGIN
+      call _cleanup_script_tables();
+      RESIGNAL;
+    END;
+   */
   
   set @@max_sp_recursion_depth := 127;
   set @__script_group_concat_max_len := @@group_concat_max_len;
@@ -6339,13 +6530,8 @@ main_body: begin
     call _script_report_finalize();
   end if;
   
-  set @@group_concat_max_len := @__script_group_concat_max_len;  
-  if not (@query_script_skip_cleanup is true) then
-    delete from _sql_tokens;
-    delete from _qs_variables;
-    delete from _script_report_data;
-    -- delete from _split_column_names_table;
-  end if;
+  set @@group_concat_max_len := @__script_group_concat_max_len;
+  call _cleanup_script_tables();
 end;
 //
 
@@ -6501,9 +6687,9 @@ begin
   end if;
   
   insert into 
-    _script_report_data (session_id, info) 
+    _script_report_data (server_id, session_id, info) 
   SELECT 
-    CONNECTION_ID(), split_token(@_query_script_report_line, '\n', n)
+    _get_server_id(), CONNECTION_ID(), split_token(@_query_script_report_line, '\n', n)
   FROM
     numbers
   WHERE 
@@ -7358,8 +7544,8 @@ main_body: begin
   --   call _throw_script_error(id_from, CONCAT('Duplicate local variable: ', local_variable));
   -- end if;
    
-  INSERT IGNORE INTO _qs_variables (session_id, variable_name, mapped_user_defined_variable_name, declaration_depth, declaration_id, scope_end_id) 
-    VALUES (CONNECTION_ID(), local_variable, user_defined_variable_name, depth, id_variable_declaration, id_to);
+  INSERT IGNORE INTO _qs_variables (server_id, session_id, variable_name, mapped_user_defined_variable_name, declaration_depth, declaration_id, scope_end_id) 
+    VALUES (_get_server_id(), CONNECTION_ID(), local_variable, user_defined_variable_name, depth, id_variable_declaration, id_to);
   if ROW_COUNT() = 0 and throw_when_exists then
     call _throw_script_error(id_variable_declaration, CONCAT('Duplicate local variable: ', local_variable));
   end if;
@@ -7994,7 +8180,7 @@ main_body: begin
 
   set @_split_is_first_step_flag := true;
   
-  call _split_deduce_columns(split_table_schema, split_table_name);
+  call _split_deduce_columns(split_table_schema, split_table_name, get_option(split_options, 'index'));
   call _split_init_variables();
   call _split_assign_min_max_variables(id_from, split_table_schema, split_table_name, split_options, is_empty_range);
   
@@ -8350,7 +8536,7 @@ DELIMITER ;
 DELIMITER $$
 
 DROP PROCEDURE IF EXISTS _split_deduce_columns $$
-CREATE PROCEDURE _split_deduce_columns(split_table_schema varchar(128), split_table_name varchar(128)) 
+CREATE PROCEDURE _split_deduce_columns(split_table_schema varchar(128), split_table_name varchar(128), requested_index_name varchar(128)) 
 MODIFIES SQL DATA
 SQL SECURITY INVOKER
 COMMENT 'split values by columns...'
@@ -8359,7 +8545,7 @@ begin
   declare split_column_names varchar(2048) default NULL;
   declare split_num_column tinyint unsigned;
 
-  call _split_generate_dependency_tables(split_table_schema, split_table_name);
+  call _split_generate_dependency_tables(split_table_schema, split_table_name, requested_index_name);
   
   SELECT 
       column_names, count_column_in_index, index_name
@@ -8372,6 +8558,9 @@ begin
     
   call _split_cleanup_dependency_tables();
 
+  if (requested_index_name is not null) and ((requested_index_name = @_query_script_split_index_name) IS NOT TRUE) then
+    call throw(CONCAT('split: index: ', requested_index_name, ' requested, but not found/not unique'));
+  end if;
   if split_column_names is null then
     call throw(CONCAT('split: no key or definition found for: ', split_table_schema, '.', split_table_name));
   end if;
@@ -8381,6 +8570,7 @@ begin
   delete from _split_column_names_table;
   insert into _split_column_names_table
     select
+      _get_server_id(),
       CONNECTION_ID(),
       n,
       split_table_name,
@@ -8412,7 +8602,7 @@ DELIMITER ;
 DELIMITER $$
 
 DROP PROCEDURE IF EXISTS _split_generate_dependency_tables $$
-CREATE PROCEDURE _split_generate_dependency_tables(split_table_schema varchar(128), split_table_name varchar(128)) 
+CREATE PROCEDURE _split_generate_dependency_tables(split_table_schema varchar(128), split_table_name varchar(128), requested_index_name varchar(128)) 
 MODIFIES SQL DATA
 SQL SECURITY INVOKER
 COMMENT 'analyze recommended keys'
@@ -8505,6 +8695,7 @@ begin
     FROM 
       _split_candidate_keys
     ORDER BY   
+      (INDEX_NAME = requested_index_name) IS TRUE DESC,
       has_nullable ASC, covered_columns_length ASC, is_primary DESC
     LIMIT 1
   ;
@@ -11503,6 +11694,7 @@ VIEW _qs_variables AS
     _global_qs_variables
   WHERE
     session_id = CONNECTION_ID()
+with check option
 ;
 
 -- 
@@ -11518,7 +11710,9 @@ VIEW _script_report_data AS
   FROM
     _global_script_report_data
   WHERE
-    session_id = CONNECTION_ID()
+    server_id = _get_server_id()
+    and session_id = CONNECTION_ID()
+with check option
 ;
 
 -- 
@@ -11535,6 +11729,7 @@ VIEW _split_column_names_table AS
     _global_split_column_names_table
   WHERE
     session_id = CONNECTION_ID()
+with check option
 ;
 
 -- 
@@ -11551,6 +11746,7 @@ VIEW _sql_tokens AS
     _global_sql_tokens
   WHERE
     session_id = CONNECTION_ID()
+with check option
 ;
 DROP TABLE IF EXISTS `routine_privileges`;
 
@@ -12126,6 +12322,149 @@ catch {
 
 call run(@script);
 
+--
+--
+--
+set @script := "
+try {
+  set @common_schema_tokudb_expected := @common_schema_tokudb_expected + 1; 
+-- 
+-- Generate an ALTER TABLE statement for converting tables to TokuDB
+-- 
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW _sql_alter_table_tokudb_internal AS
+  SELECT 
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    ENGINE,
+    concat(
+      sql_drop_keys, ', ', sql_add_keys, 
+      ', engine=tokudb row_format=tokudb_fast key_block_size=0') as alter_fast_clause,
+    concat(
+      sql_drop_keys, ', ', sql_add_keys, 
+      ', engine=tokudb row_format=tokudb_small key_block_size=0') as alter_small_clause
+  FROM 
+    sql_alter_table
+;
+
+
+CREATE OR REPLACE
+ALGORITHM = MERGE
+SQL SECURITY INVOKER
+VIEW sql_alter_table_tokudb AS
+  SELECT 
+    TABLE_SCHEMA,
+    TABLE_NAME,
+    ENGINE,
+    alter_fast_clause,
+    concat(
+      'alter table ', mysql_qualify(table_schema), '.', mysql_qualify(table_name), ' ', alter_fast_clause) as sql_alter_fast,
+    alter_small_clause,
+    concat(
+      'alter table ', mysql_qualify(table_schema), '.', mysql_qualify(table_name), ' ', alter_small_clause) as sql_alter_small
+  FROM 
+    _sql_alter_table_tokudb_internal
+;
+
+
+  set @common_schema_tokudb_installed := @common_schema_tokudb_installed + 1;
+}
+catch {
+}
+";
+
+call run(@script);
+
+--
+--
+--
+set @script := "
+try {
+  set @common_schema_tokudb_expected := @common_schema_tokudb_expected + 1; 
+
+-- 
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW _tokudb_table_breakdown_map AS
+  SELECT 
+    *,
+    split_token(dictionary_name, '/', 2) as table_schema,
+    split_token(LEFT(dictionary_name, CHAR_LENGTH(dictionary_name)-CHAR_LENGTH('-main')), '/', 3) as table_name
+  FROM
+    INFORMATION_SCHEMA.TokuDB_file_map
+  WHERE
+    dictionary_name like './%-main'
+;
+
+-- 
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW _tokudb_table_p_filenames_map AS
+  SELECT 
+    table_schema, 
+    table_name, 
+    count(*) as count_files,
+    group_concat(tokudb_file_map.internal_file_name order by tokudb_file_map.internal_file_name) as files
+  FROM
+    _tokudb_table_breakdown_map
+    JOIN information_schema.tokudb_file_map ON (tokudb_file_map.dictionary_name LIKE CONCAT('./', table_schema, '/', table_name, '-%'))
+  GROUP BY
+    table_schema, table_name
+;
+
+-- 
+-- 
+-- 
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW _tokudb_table_filenames_map AS
+  SELECT 
+    table_schema, 
+    substring_index(table_name, '#P#', 1) as table_name,
+    SUM(count_files) as count_files,
+    group_concat(files order by table_name) as files
+  FROM
+    _tokudb_table_p_filenames_map
+  GROUP BY
+    1, 2
+;
+
+-- 
+-- map TokuDB tables to files and common shell commands
+-- 
+
+CREATE OR REPLACE
+ALGORITHM = TEMPTABLE
+SQL SECURITY INVOKER
+VIEW tokudb_file_map AS
+  SELECT 
+    table_schema,
+    table_name,
+    count_files,
+    files,
+    concat('ls -l ', replace(files, ',', ' ')) as bash_ls,
+    concat('du -ch ', replace(files, ',', ' '), ' | tail -n 1') as bash_du
+  FROM
+    _tokudb_table_filenames_map
+;
+
+  set @common_schema_tokudb_installed := @common_schema_tokudb_installed + 1;
+}
+catch {
+}
+";
+
+call run(@script);
+
 
 			INSERT INTO common_schema._named_scripts (script_name, script_text) VALUES ('security_audit','
 report h1 ''Checking for non-local root accounts'';
@@ -12411,14 +12750,20 @@ Requirements
 
 The common_schema distribution file supports MySQL 5.1, 5.5 and 5.6, Oracle
 distribution, Percona Server and MariaDB.
-Percona Server features are supported for versions >= 5.5.8. Please note that
-common_schema will install regardless of the version. It will automatically
-recognize available feature set and install accordingly. Likewise, it will
-install regardless of the availability of InnoDB Plugin and associated
-INFORMATION_SCHEMA tables.
+Percona Server features are supported for versions >= 5.5.8. TokuDB features
+are supported on TokuDB enabled servers. Please note that common_schema will
+install regardless of the version. It will automatically recognize available
+feature set and install accordingly. Likewise, it will install regardless of
+the availability of InnoDB Plugin and associated INFORMATION_SCHEMA tables.
 If you should upgrade your MySQL server, or enable features which were turned
 off during install of common_schema, the new feature set are not automatically
 available by common_schema, and a re-install of common_schema is required.
+
+Installation notes
+
+The installation process drops and creates various tables and routines. In
+particular, the installation process breaks any running QueryScript code.
+Avoid installing common_schema during QueryScript executions.
 
 Troubleshooting
 
@@ -21104,6 +21449,9 @@ within a script. A few limitations follow:
   unexpected. You must not call code which calls these routines, such as the
   foreach() routine (as opposed to the perfectly valid foreach statement).
 
+The common_schema installation process breaks any running scripts (to be
+changed in the future). Avoid re-installing common_schema while QueryScript
+code executes.
 
 Performance
 
@@ -22543,6 +22891,10 @@ own, and does not require instruction. However, the user is given the choice
 of fine tuning split''s operation by providing any combination of the following
 paramaters:
 
+* index: explicit name of index to use for splitting. The index must exist
+  under given name and must be UNIQUE, or else an error is thrown.
+  By default split chooses the best index for splitting the table without
+  hint.
 * size: number of rows used in each step (minimum: 100; maximum: 50,000;
   default: 1,000)
 * start: starting point for the split operation. This is a comma delimited
@@ -22550,6 +22902,7 @@ paramaters:
   The count of values must match the number of columns in the index picked by
   split. Thus, if split picks an AUTO_INCREMENT PRIMARY KEY for the operation,
   the value is merely a single integer.
+  It makes most sense to use this parameters in conjunction with index.
   Compound values such as ''2013-07-05,12,smith'' are valid.
   Values do not have to strictly exist in the table: the split operation will
   begin as of these values, meaning starting at the first row with these exact
@@ -22562,6 +22915,7 @@ paramaters:
   The count of values must match the number of columns in the index picked by
   split. Thus, if split picks an AUTO_INCREMENT PRIMARY KEY for the operation,
   the value is merely a single integer.
+  It makes most sense to use this parameters in conjunction with index.
   Compound values such as ''2013-07-05,12,smith'' are valid.
   Values do not have to strictly exist in the table: the split operation will
   run up to these values, meaning stopping at the first row with these exact
@@ -23062,11 +23416,9 @@ Otherwise, it makes for the (ungraceful) termination of the script''s
 execution. If an active transaction is in place, it is rolled back.
 throw takes a text parameter, which is the error message. It is stored in the
 @common_schema_error variable.
-Since SIGNAL is only introduced in MySQL 5.5, current implementation of throw
-uses a dirty trick to raise an error, in the form of attempting to SELECT from
-a non-existent table. The result is a rather obscure error message, noting
-that some table does not exist. The name of the non-existing table is actually
-the error message.
+On a MySQL >= 5.5 server this statement calls upon SIGNAL. On a 5.1 server it
+generates a statement which reads from a non-existent table, producing an
+awkward yet informative error message.
 
 EXAMPLES
 
@@ -23081,7 +23433,7 @@ Throw, get the error message:
            throw ''x is too low!'';
        }
 
-       ERROR 1146 (42S02): Table ''error.''x is too low!'''' doesn''t exist
+       ERROR 1644 (91100): x is too low!
 
        mysql> select @common_schema_error;
        +----------------------+
@@ -26260,6 +26612,7 @@ Schema analysis routines: stored routines providing information on schema
 definitions
 
 * table_exists(): Check if specified table exists.
+* table_rotate(): Rotate a table logrotate-style.
 
 
 DESCRIPTION
@@ -27740,6 +28093,125 @@ AUTHOR
 Shlomi Noach
 ');
 		
+			INSERT INTO common_schema.help_content VALUES ('sql_alter_table_tokudb','
+NAME
+
+sql_alter_table_tokudb: Generate ALTER TABLE SQL statements for converting
+tables to TokuDB
+
+TYPE
+
+View
+
+DESCRIPTION
+
+sql_alter_table_tokudb provides with SQL statements to alter a table to TokuDB
+in two compression formats, and overcoming issue of KEY_BLOCK_SIZE
+There is a known issue with converting COMPRESSED InnoDB tables to TokuDB (<=
+7.0.4 at this time).
+When the KEY_BLOCK_SIZE create option is specified, TokuDB wrongly applies it
+to all indexes, which makes for file size bloating instead of compression.
+The only solution known to the author of this tool is to DROP all keys, reset
+the KEY_BLOCK_SIZE to 0 and add all keys again. Fortunately, this can be done
+in one (long) ALTER statement.
+This view provides such statements.
+
+STRUCTURE
+
+
+
+       mysql> DESC sql_alter_table_tokudb;
+       +--------------------+-------------+------+-----+---------+-------
+       +
+       | Field              | Type        | Null | Key | Default | Extra
+       |
+       +--------------------+-------------+------+-----+---------+-------
+       +
+       | TABLE_SCHEMA       | varchar(64) | NO   |     |         |
+       |
+       | TABLE_NAME         | varchar(64) | NO   |     |         |
+       |
+       | ENGINE             | varchar(64) | YES  |     | NULL    |
+       |
+       | alter_fast_clause  | mediumtext  | YES  |     | NULL    |
+       |
+       | sql_alter_fast     | mediumtext  | YES  |     | NULL    |
+       |
+       | alter_small_clause | mediumtext  | YES  |     | NULL    |
+       |
+       | sql_alter_small    | mediumtext  | YES  |     | NULL    |
+       |
+       +--------------------+-------------+------+-----+---------+-------
+       +
+
+
+
+SYNOPSIS
+
+Columns of this view:
+
+* TABLE_SCHEMA: schema of current table
+* TABLE_NAME: current table name
+* ENGINE: current engine name
+* alter_fast_clause: The clause for ALTER TABLE to convert current table to
+  TokuDB in TOKUDB_FAST (lightweight compression) row format.
+* sql_alter_fast: A complete ALTER TABLE statement to convert current table to
+  TokuDB in TOKUDB_FAST (lightweight compression) row format.
+* alter_small_clause: The clause for ALTER TABLE to convert current table to
+  TokuDB in TOKUDB_SMALL (aggressive compression) row format.
+* sql_alter_small: A complete ALTER TABLE statement to convert current table
+  to TokuDB in TOKUDB_SMALL (aggressive compression) row format.
+
+The SQL statements are not terminated by '';''.
+
+EXAMPLES
+
+Generate ALTER TABLE statements for a test table:
+
+
+       mysql> create table test.t (
+         id int,
+         c char,
+         dt datetime,
+         d double,
+         PRIMARY KEY (id),
+         KEY (dt, c)
+       );
+
+       mysql> select * from common_schema.sql_alter_table_tokudb where
+       table_schema=''test'' and table_name=''t'' \\G
+
+             TABLE_SCHEMA: test
+               TABLE_NAME: t
+                   ENGINE: InnoDB
+        alter_fast_clause: DROP KEY `dt`, DROP PRIMARY KEY, ADD KEY `dt`
+       (`dt`,`c`), ADD PRIMARY KEY (`id`), engine=tokudb
+       row_format=tokudb_small key_block_size=0;
+           sql_alter_fast: alter table `test`.`t` DROP KEY `dt`, DROP
+       PRIMARY KEY, ADD KEY `dt`(`dt`,`c`), ADD PRIMARY KEY (`id`),
+       engine=tokudb row_format=tokudb_small key_block_size=0;
+       alter_small_clause: DROP KEY `dt`, DROP PRIMARY KEY, ADD KEY `dt`
+       (`dt`,`c`), ADD PRIMARY KEY (`id`), engine=tokudb
+       row_format=tokudb_small key_block_size=0;
+          sql_alter_small: alter table `test`.`t` DROP KEY `dt`, DROP
+       PRIMARY KEY, ADD KEY `dt`(`dt`,`c`), ADD PRIMARY KEY (`id`),
+       engine=tokudb row_format=tokudb_small key_block_size=0;
+
+
+
+ENVIRONMENT
+
+TokuDB enabled server (>= 5.5)
+
+SEE ALSO
+
+sql_alter_table, tokudb_file_map
+
+AUTHOR
+
+Shlomi Noach
+');
+		
 			INSERT INTO common_schema.help_content VALUES ('sql_foreign_keys','
 NAME
 
@@ -29191,7 +29663,139 @@ MySQL 5.1 or newer
 
 SEE ALSO
 
-Schema_analysis
+Schema_analysis, table_rotate
+
+AUTHOR
+
+Shlomi Noach
+');
+		
+			INSERT INTO common_schema.help_content VALUES ('table_rotate','
+NAME
+
+table_rotate(): rotate a table logrotate-style
+
+TYPE
+
+Procedure
+
+DESCRIPTION
+
+This routine rotates a table much like logrotate rotates log files.
+A call onto table_rotate renames (or versions) given table, while pushing
+already existing versions tables down the line. A new empty table is created
+to replace existing table. The "oldest" table is optionally dropped.
+Table creation and dropping are done in the background, and table rotation for
+all tables is done as atomic operation via RENAME_TABLE.
+A rotated table is renamed by appending "__n", where n is the version number
+(1, 2, 3, ...).
+
+SYNOPSIS
+
+
+
+       table_rotate(
+           IN table_schema varchar(64) charset utf8,
+           IN table_name varchar(64) charset utf8,
+           IN rotate_limit smallint unsigned
+         )
+
+
+Input:
+
+* table_schema: schema of table to rotate
+* table_name: name of table to rotate
+* rotate_limit: maximum number of rotated tables to keep. Negative, 0 or NULL
+  imply "no limitation".
+
+
+EXAMPLES
+
+Create a table, populate it, rotate it:
+
+
+       mysql> create table test.t select 17 as id from dual;
+
+       mysql> show tables from test;
+       +----------------+
+       | Tables_in_test |
+       +----------------+
+       | t              |
+       +----------------+
+
+       mysql> select * from test.t;
+       +----+
+       | id |
+       +----+
+       | 17 |
+       +----+
+
+       mysql> call table_rotate(''test'', ''t'', 3);
+
+       mysql> show tables from test;
+       +----------------+
+       | Tables_in_test |
+       +----------------+
+       | t              |
+       | t__1           |
+       +----------------+
+
+       mysql> call table_rotate(''test'', ''t'', 3);
+
+       mysql> call table_rotate(''test'', ''t'', 3);
+
+       mysql> show tables from test;
+       +----------------+
+       | Tables_in_test |
+       +----------------+
+       | t              |
+       | t__1           |
+       | t__2           |
+       | t__3           |
+       +----------------+
+
+       mysql> select * from test.t;
+       Empty set (0.00 sec)
+
+       mysql> select * from test.t__3;
+       +----+
+       | id |
+       +----+
+       | 17 |
+       +----+
+
+
+Note in the above how the value 17 is found in rotated table t__3, not in
+newly created empty t.
+Further rotate the table:
+
+
+       mysql> call table_rotate(''test'', ''t'', 3);
+
+       mysql> show tables from test;
+       +----------------+
+       | Tables_in_test |
+       +----------------+
+       | t              |
+       | t__1           |
+       | t__2           |
+       | t__3           |
+       +----------------+
+
+       mysql> select * from test.t__3;
+       Empty set (0.00 sec)
+
+
+In the above rotated tables reached the rotate_limit count; the oldest was
+dropped. The value 17 is now lost.
+
+ENVIRONMENT
+
+MySQL 5.1 or newer
+
+SEE ALSO
+
+table_exists()
 
 AUTHOR
 
@@ -29703,6 +30307,9 @@ This is done by invoking an invalid command on the server. The result of such
 invocation will break execution of calling code. If this routine is invoked
 from another routine, the entire call stack is aborted. If this routine is
 called during a transaction, the transaction aborts and rolls back.
+On a MySQL >= 5.5 server this routine calls upon SIGNAL. On a 5.1 server it
+generates a statement which reads from an invalid table, producing an awkward
+yet informative error message.
 
 SYNOPSIS
 
@@ -29724,12 +30331,11 @@ Output:
 
 EXAMPLES
 
-Invoke throw() directly:
+Invoke throw() directly, on a 5.1 MySQL server:
 
 
        mysql> call throw(''Unknown variable type'');
-       ERROR 1146 (42S02): Table ''error.Unknown variable type'' doesn''t
-       exist
+       ERROR 1644 (91100): Unknown variable type
 
        mysql> SELECT @common_schema_error;
        +-----------------------+
@@ -29737,6 +30343,14 @@ Invoke throw() directly:
        +-----------------------+
        | Unknown variable type |
        +-----------------------+
+
+
+Invoke throw() directly, on a 5.1 MySQL server:
+
+
+       mysql> call throw(''Unknown variable type'');
+       ERROR 1146 (42S02): Table ''error.Unknown variable type'' doesn''t
+       exist
 
 
 Invoke a syntactically invalid script; the run() routine and subroutines
@@ -29828,6 +30442,462 @@ get_num_tokens(), split_token(), prettify_message()
 AUTHOR
 
 Shlomi Noach
+');
+		
+			INSERT INTO common_schema.help_content VALUES ('tokudb_file_map','
+NAME
+
+tokudb_file_map: map TokuDB tables to files and common shell commands
+
+TYPE
+
+View
+
+DESCRIPTION
+
+tokudb_file_map provides a per table listing of underlying TokuDB files.
+TokuDB generates a file per index in table. For a partitioned table, that''s
+one file per index per partition, and in any case this amounts to multiple
+files per table.
+TokuDB provides with the INFORMATION_SCHEMA.TokuDB_file_map view; however it
+is not normalized, and only maps an internal TokuDB entity to file name.
+common_schema''s tokudb_file_map lists the files on a per table basis,
+answering the common question of "which files represent my table?".
+It also adds common shell queries to answer questions such as "what is the
+total size of files for my table?"
+
+STRUCTURE
+
+
+
+       mysql> DESC tokudb_file_map;
+       +--------------+------------+------+-----+---------+-------+
+       | Field        | Type       | Null | Key | Default | Extra |
+       +--------------+------------+------+-----+---------+-------+
+       | table_schema | text       | YES  |     | NULL    |       |
+       | table_name   | text       | YES  |     | NULL    |       |
+       | count_files  | bigint(21) | NO   |     | 0       |       |
+       | files        | mediumtext | YES  |     | NULL    |       |
+       | bash_ls      | mediumtext | YES  |     | NULL    |       |
+       | bash_du      | mediumtext | YES  |     | NULL    |       |
+       +--------------+------------+------+-----+---------+-------+
+
+
+
+SYNOPSIS
+
+Columns of this view:
+
+* table_schema: schema of TokuDB table.
+* table_name: TokuDB table name.
+* count_files: number of files representing this table.
+* files: comma delimited list of files representing this table.
+* bash_ls: shell ls command to show files of this table.
+* bash_du: shell du command to present total size of files representing this
+  table.
+
+Shell commands are to be executed from within the @@datadir path, and require
+file system privileges; this is outside MySQL''s scope.
+
+EXAMPLES
+
+List TokuDB files for a given table:
+
+
+       mysql> select * from tokudb_file_map where table_name=''my_table''
+       \\G
+       *************************** 1. row ***************************
+       table_schema: my_dwh
+         table_name: my_table
+        count_files: 42
+              files: ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_algo_ix_a71975_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_cluster_id_ix_a71975_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_date_clustering_type_ix_a71975_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_widget_ix_a71975_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_main_a71975_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_status_a71975_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_algo_ix_a71976_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_cluster_id_ix_a71976_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_date_clustering_type_ix_a71976_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_widget_ix_a71976_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_main_a71976_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_status_a71976_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_algo_ix_a71977_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_cluster_id_ix_a71977_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_date_clustering_type_ix_a71977_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_widget_ix_a71977_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_main_a71977_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_status_a71977_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_algo_ix_a71978_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_cluster_id_ix_a71978_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_date_clustering_type_ix_a71978_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_widget_ix_a71978_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_main_a71978_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_status_a71978_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_algo_ix_a71979_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_cluster_id_ix_a71979_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_date_clustering_type_ix_a71979_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_widget_ix_a71979_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_main_a71979_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_status_a71979_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_algo_ix_a7197a_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_cluster_id_ix_a7197a_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_date_clustering_type_ix_a7197a_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_widget_ix_a7197a_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_main_a7197a_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_status_a7197a_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_algo_ix_a7197b_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_cluster_id_ix_a7197b_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_date_clustering_type_ix_a7197b_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_widget_ix_a7197b_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_main_a7197b_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_status_a7197b_1_18.tokudb
+            bash_ls: ls -l ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_algo_ix_a71975_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_cluster_id_ix_a71975_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_date_clustering_type_ix_a71975_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_widget_ix_a71975_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2010_main_a71975_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_status_a71975_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_algo_ix_a71976_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_cluster_id_ix_a71976_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_date_clustering_type_ix_a71976_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_widget_ix_a71976_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2011_main_a71976_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_status_a71976_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_algo_ix_a71977_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_cluster_id_ix_a71977_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_date_clustering_type_ix_a71977_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_widget_ix_a71977_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2012_main_a71977_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_status_a71977_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_algo_ix_a71978_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_cluster_id_ix_a71978_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_date_clustering_type_ix_a71978_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_widget_ix_a71978_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2013_main_a71978_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_status_a71978_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_algo_ix_a71979_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_cluster_id_ix_a71979_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_date_clustering_type_ix_a71979_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_widget_ix_a71979_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2014_main_a71979_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_status_a71979_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_algo_ix_a7197a_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_cluster_id_ix_a7197a_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_date_clustering_type_ix_a7197a_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_widget_ix_a7197a_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2015_main_a7197a_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_status_a7197a_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_algo_ix_a7197b_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_cluster_id_ix_a7197b_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_date_clustering_type_ix_a7197b_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_widget_ix_a7197b_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_all_main_a7197b_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_status_a7197b_1_18.tokudb
+            bash_du: du -ch ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_algo_ix_a71975_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_cluster_id_ix_a71975_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_date_clustering_type_ix_a71975_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_widget_ix_a71975_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2010_main_a71975_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_status_a71975_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_algo_ix_a71976_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_cluster_id_ix_a71976_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_date_clustering_type_ix_a71976_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_widget_ix_a71976_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2011_main_a71976_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_status_a71976_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_algo_ix_a71977_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_cluster_id_ix_a71977_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_date_clustering_type_ix_a71977_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_widget_ix_a71977_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2012_main_a71977_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_status_a71977_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_algo_ix_a71978_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_cluster_id_ix_a71978_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_date_clustering_type_ix_a71978_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_widget_ix_a71978_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2013_main_a71978_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_status_a71978_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_algo_ix_a71979_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_cluster_id_ix_a71979_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_date_clustering_type_ix_a71979_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_widget_ix_a71979_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2014_main_a71979_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_status_a71979_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_algo_ix_a7197a_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_cluster_id_ix_a7197a_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_date_clustering_type_ix_a7197a_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_widget_ix_a7197a_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2015_main_a7197a_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_status_a7197a_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_algo_ix_a7197b_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_cluster_id_ix_a7197b_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_date_clustering_type_ix_a7197b_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_widget_ix_a7197b_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_all_main_a7197b_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_status_a7197b_1_18.tokudb |
+       tail -n 1
+
+
+
+ENVIRONMENT
+
+TokuDB enabled server (>= 5.5)
+
+SEE ALSO
+
+sql_alter_table_tokudb, sql_range_partitions
+
+AUTHOR
+
+Shlomi Noach
+');
+		
+			INSERT INTO common_schema.help_content VALUES ('tokudb_views','
+SYNOPSIS
+
+TokuDB views: views providing insight or operations on TokuDB tables
+
+* sql_alter_table_tokudb: Generate ALTER TABLE SQL statements for converting
+  tables to TokuDB
+* tokudb_file_map: map TokuDB tables to files and common shell commands
+
+
+DESCRIPTION
+
+These views provide insight and operation on TokuDB tables. They come to
+overcome limitation in TokuDB (7.0.3 at this time of writing).
+
+EXAMPLES
+
+List TokuDB files for a given table:
+
+
+       mysql> select * from tokudb_file_map where table_name=''my_table''
+       \\G
+       *************************** 1. row ***************************
+       table_schema: my_dwh
+         table_name: my_table
+        count_files: 42
+              files: ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_algo_ix_a71975_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_cluster_id_ix_a71975_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_date_clustering_type_ix_a71975_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_widget_ix_a71975_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_main_a71975_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_status_a71975_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_algo_ix_a71976_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_cluster_id_ix_a71976_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_date_clustering_type_ix_a71976_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_widget_ix_a71976_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_main_a71976_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_status_a71976_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_algo_ix_a71977_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_cluster_id_ix_a71977_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_date_clustering_type_ix_a71977_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_widget_ix_a71977_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_main_a71977_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_status_a71977_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_algo_ix_a71978_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_cluster_id_ix_a71978_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_date_clustering_type_ix_a71978_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_widget_ix_a71978_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_main_a71978_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_status_a71978_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_algo_ix_a71979_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_cluster_id_ix_a71979_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_date_clustering_type_ix_a71979_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_widget_ix_a71979_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_main_a71979_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_status_a71979_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_algo_ix_a7197a_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_cluster_id_ix_a7197a_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_date_clustering_type_ix_a7197a_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_widget_ix_a7197a_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_main_a7197a_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_status_a7197a_1_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_algo_ix_a7197b_3_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_cluster_id_ix_a7197b_4_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_date_clustering_type_ix_a7197b_5_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_widget_ix_a7197b_6_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_main_a7197b_2_18.tokudb,./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_status_a7197b_1_18.tokudb
+            bash_ls: ls -l ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_algo_ix_a71975_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_cluster_id_ix_a71975_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_date_clustering_type_ix_a71975_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_widget_ix_a71975_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2010_main_a71975_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_status_a71975_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_algo_ix_a71976_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_cluster_id_ix_a71976_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_date_clustering_type_ix_a71976_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_widget_ix_a71976_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2011_main_a71976_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_status_a71976_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_algo_ix_a71977_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_cluster_id_ix_a71977_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_date_clustering_type_ix_a71977_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_widget_ix_a71977_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2012_main_a71977_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_status_a71977_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_algo_ix_a71978_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_cluster_id_ix_a71978_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_date_clustering_type_ix_a71978_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_widget_ix_a71978_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2013_main_a71978_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_status_a71978_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_algo_ix_a71979_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_cluster_id_ix_a71979_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_date_clustering_type_ix_a71979_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_widget_ix_a71979_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2014_main_a71979_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_status_a71979_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_algo_ix_a7197a_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_cluster_id_ix_a7197a_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_date_clustering_type_ix_a7197a_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_widget_ix_a7197a_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2015_main_a7197a_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_status_a7197a_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_algo_ix_a7197b_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_cluster_id_ix_a7197b_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_date_clustering_type_ix_a7197b_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_widget_ix_a7197b_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_all_main_a7197b_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_status_a7197b_1_18.tokudb
+            bash_du: du -ch ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_algo_ix_a71975_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_cluster_id_ix_a71975_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_date_clustering_type_ix_a71975_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_key_trns_pub_widget_ix_a71975_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2010_main_a71975_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2010_status_a71975_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_algo_ix_a71976_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_cluster_id_ix_a71976_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_date_clustering_type_ix_a71976_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_key_trns_pub_widget_ix_a71976_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2011_main_a71976_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2011_status_a71976_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_algo_ix_a71977_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_cluster_id_ix_a71977_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_date_clustering_type_ix_a71977_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_key_trns_pub_widget_ix_a71977_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2012_main_a71977_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2012_status_a71977_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_algo_ix_a71978_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_cluster_id_ix_a71978_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_date_clustering_type_ix_a71978_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_key_trns_pub_widget_ix_a71978_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2013_main_a71978_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2013_status_a71978_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_algo_ix_a71979_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_cluster_id_ix_a71979_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_date_clustering_type_ix_a71979_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_key_trns_pub_widget_ix_a71979_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2014_main_a71979_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2014_status_a71979_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_algo_ix_a7197a_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_cluster_id_ix_a7197a_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_date_clustering_type_ix_a7197a_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_key_trns_pub_widget_ix_a7197a_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_2015_main_a7197a_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_2015_status_a7197a_1_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_algo_ix_a7197b_3_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_cluster_id_ix_a7197b_4_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_date_clustering_type_ix_a7197b_5_18.tokudb
+       ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_key_trns_pub_widget_ix_a7197b_6_18.tokudb
+       ./_my_dwh_sql_4665_15be_P_trns_pt_all_main_a7197b_2_18.tokudb ./
+       _my_dwh_sql_4665_15be_P_trns_pt_all_status_a7197b_1_18.tokudb |
+       tail -n 1
+
+
 ');
 		
 			INSERT INTO common_schema.help_content VALUES ('trim_wspace','
@@ -29978,6 +31048,14 @@ WHERE
   attribute_name = 'percona_server_components_installed'
 ;
 
+UPDATE 
+  metadata
+SET 
+  attribute_value = ((@common_schema_tokudb_installed > 0) AND (@common_schema_tokudb_installed = @common_schema_tokudb_expected))
+WHERE 
+  attribute_name = 'tokudb_components_installed'
+;
+
 FLUSH TABLES mysql.db;
 FLUSH TABLES mysql.proc;
 
@@ -30009,6 +31087,13 @@ SET @message := CONCAT(@message, '\n- Percona Server components: ',
 	WHEN 0 THEN 'not installed'
 	WHEN @common_schema_percona_server_expected THEN 'installed'
     ELSE CONCAT('partial install: ', @common_schema_percona_server_installed, '/', @common_schema_percona_server_expected)	
+  END
+);
+SET @message := CONCAT(@message, '\n- TokuDB components: ', 
+  CASE @common_schema_tokudb_installed
+	WHEN 0 THEN 'not installed'
+	WHEN @common_schema_tokudb_expected THEN 'installed'
+    ELSE CONCAT('partial install: ', @common_schema_tokudb_installed, '/', @common_schema_tokudb_expected)	
   END
 );
 SET @message := CONCAT(@message, '\n');

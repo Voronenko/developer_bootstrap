@@ -1,0 +1,13 @@
+sudo apt-get install software-properties-common
+
+sudo apt-key adv –recv-keys –keyserver keyserver.ubuntu.com 0xcbcb082a1bb943db
+
+# 13.10
+sudo add-apt-repository 'deb http://ftp.osuosl.org/pub/mariadb/repo/5.5/ubuntu raring main'
+
+# 12.10
+# sudo add-apt-repository 'deb http://ftp.osuosl.org/pub/mariadb/repo/5.5/ubuntu precise main'
+
+
+sudo apt-get update
+sudo apt-get install mariadb-server

@@ -1,0 +1,5 @@
+sudo add-apt-repository 'deb http://download.webmin.com/download/repository sarge contrib'
+sudo add-apt-repository 'deb http://webmin.mirror.somersettechsolutions.co.uk/repository sarge contrib'
+
+apt-get update
+apt-get install webmin

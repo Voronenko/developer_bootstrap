@@ -1,6 +1,10 @@
 developer_bootstrap
 ===================
 
+https://speakerdeck.com/voronenko/web-dev-basic-setup
+
+===================
+
 #Bookmarklets
 * Show bootstrap/foundation grid on pagr
 * Show jquery events on dom elements

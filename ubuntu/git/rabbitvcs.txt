@@ -1,3 +1,20 @@
 sudo add-apt-repository ppa:rabbitvcs/ppa
+# Alternatively
+# You can also use 'classic' way with manual repository:  
+#echo 'deb http://ppa.launchpad.net/rabbitvcs/ppa/ubuntu **DISTRIBUTION** main' | sudo tee /etc/apt/sources
 
-echo 'deb http://ppa.launchpad.net/rabbitvcs/ppa/ubuntu **DISTRIBUTION** main' | sudo tee /etc/apt/sources.list.d/RabbitVCS.list
+sudo apt-get update
+
+sudo apt-get install rabbitvcs-nautilus3 rabbitvcs-cli
+
+
+# Important note for 13.04 Raring:
+# If for some reason after install (and lightdm restart) there are no RabbitVcs menu
+# proceed with following steps:
+
+sudo ln -sf /usr/lib/i386-linux-gnu/libpython2.7.so.1 /usr/lib/libpython2.7.so.1
+sudo ln -sf /usr/lib/libpython2.7.so.1 /usr/lib/libpython2.7.so.1.0
+# and replace the /usr/share/nautilus-python/extensions/RabbitVCS.py with RabbitVCS.py
+# downloaded from
+# http://rabbitvcs.googlecode.com/svn/trunk/clients/nautilus-3.0/RabbitVCS.py
+
